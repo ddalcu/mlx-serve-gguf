@@ -1,0 +1,6 @@
+mlx-serve-gguf
+
+src/iq_tables.zig is generated from, and src/quants.zig is a port of the
+reference dequantization in, llama.cpp / ggml (ggml/src/ggml-common.h,
+ggml/src/ggml-quants.c), Copyright (c) 2023-2026 The ggml authors, MIT License.
+https://github.com/ggml-org/llama.cpp

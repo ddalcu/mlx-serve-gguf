@@ -1,0 +1,12 @@
+.{
+    .name = .mlx_serve_gguf,
+    .version = "0.1.0",
+    .fingerprint = 0x22182f46fbe7a6fd,
+    .minimum_zig_version = "0.17.0-dev.1422+e863bf3be",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{},
+}
