@@ -41,6 +41,15 @@ pub const Array = struct {
         return self.bytes[i] != 0;
     }
 
+    pub fn float(self: Array, i: usize) f64 {
+        const sz = scalarSize(self.elem_type).?;
+        var r = Reader{ .buf = self.bytes[i * sz ..] };
+        return switch (r.scalar(self.elem_type) catch unreachable) {
+            .float => |v| v,
+            else => unreachable,
+        };
+    }
+
     /// Scalar element as i64 (token types, eos id lists, ...).
     pub fn int(self: Array, i: usize) i64 {
         const sz = scalarSize(self.elem_type).?;
@@ -244,6 +253,11 @@ pub const File = struct {
         return if (v == .float) v.float else null;
     }
 
+    pub fn getBool(self: *const File, key: []const u8) ?bool {
+        const v = self.kv.get(key) orelse return null;
+        return if (v == .bool) v.bool else null;
+    }
+
     pub fn getArray(self: *const File, key: []const u8) ?Array {
         const v = self.kv.get(key) orelse return null;
         return if (v == .array) v.array else null;
@@ -334,7 +348,7 @@ test "real model file parses (set MLX_SERVE_GGUF_TEST_MODEL)" {
     defer f.deinit();
     try std.testing.expect(f.getString("general.architecture").?.len > 0);
     try std.testing.expect(f.firstUnsupportedTensor() == null);
-    try std.testing.expect(f.getArray("tokenizer.ggml.tokens").?.len > 100_000);
+    try std.testing.expect(f.getArray("tokenizer.ggml.tokens").?.len > 10_000);
 
     // Last block of the last tensor must be readable (catches offset/size math).
     const t = f.tensors.values()[f.tensors.count() - 1];

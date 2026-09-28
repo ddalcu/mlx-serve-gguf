@@ -50,17 +50,17 @@ pub fn warmKernels(allocator: std.mem.Allocator, map: *const WeightMap, s: mlx.m
         if ((try seen.getOrPut(key)).found_existing) continue;
 
         const in: c_int = @intCast(@as(usize, @intCast(ws[ws.len - 1])) / info.ty.blockBytes() * info.ty.blockElems());
-        // One row = the decode matvec, 16 = the prefill kernel (an expert bank has just the one).
-        const widths: []const c_int = if (bank) &.{1} else &.{ 1, 16 };
-        for (widths) |m| {
+        // One row = the decode matvec, 16 = the prefill tile kernel.
+        for ([_]c_int{ 1, 16 }) |m| {
             var x = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x);
-            const x_shape: []const c_int = if (bank) &.{ 1, 1, in } else &.{ m, in };
+            const x_shape: []const c_int = if (bank) &.{ m, 1, in } else &.{ m, in };
             try mlx.check(mlx.mlx_zeros(&x, x_shape.ptr, x_shape.len, .bfloat16, s));
             const y = if (bank) blk: {
-                const expert = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{1}, 1, .uint32);
-                defer _ = mlx.mlx_array_free(expert);
-                break :blk try kernels.gatherLinear(.{ .ty = info.ty }, x, w, .{ .ctx = null }, expert, s);
+                var experts = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(experts);
+                try mlx.check(mlx.mlx_zeros(&experts, &[_]c_int{m}, 1, .uint32, s));
+                break :blk try kernels.gatherLinear(.{ .ty = info.ty }, x, w, .{ .ctx = null }, experts, s);
             } else try kernels.linear(.{ .ty = info.ty }, x, w, s);
             defer _ = mlx.mlx_array_free(y);
             try mlx.check(mlx.mlx_array_eval(y));
@@ -89,6 +89,27 @@ fn loadQuantized(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.
     if (t.n_dims != 2) return error.UnsupportedTensor;
     const row_bytes = t.data.len / rows;
     const shape = [_]c_int{ @intCast(rows), @intCast(row_bytes) };
+
+    if (mapped.transform == .split_ba) {
+        const g = mapped.transform.split_ba;
+        const nv = g.nk * g.r;
+        if (rows != 2 * nv) return error.BadShape;
+        const marker = ".in_proj_ba.";
+        const at = std.mem.indexOf(u8, mapped.name, marker) orelse return error.UnsupportedTensor;
+        const tmp = try allocator.alloc(u8, nv * row_bytes);
+        defer allocator.free(tmp);
+        for ([_][]const u8{ ".in_proj_b.", ".in_proj_a." }, 0..) |half_name, half| {
+            for (0..g.nk) |k| for (0..g.r) |j| {
+                const src = (k * 2 * g.r + half * g.r + j) * row_bytes;
+                @memcpy(tmp[(k * g.r + j) * row_bytes ..][0..row_bytes], t.data[src..][0..row_bytes]);
+            };
+            var name_buf: [160]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "{s}{s}{s}", .{ mapped.name[0..at], half_name, mapped.name[at + marker.len ..] });
+            try put(allocator, out, name, mlx.mlx_array_new_data(tmp.ptr, &[_]c_int{ @intCast(nv), @intCast(row_bytes) }, 2, .uint8));
+            try putSentinel(allocator, out, name, .{ .ty = t.ty }, s);
+        }
+        return;
+    }
 
     var info = kernels.Info{ .ty = t.ty };
     const w = switch (mapped.transform) {
@@ -147,6 +168,22 @@ fn loadFloat(allocator: std.mem.Allocator, t: gguf.Tensor, transform: arch_mod.T
             if (t.n_dims != 1) return error.BadShape;
             break :blk mlx.mlx_array_new_data(t.data.ptr, &[_]c_int{ 1, shape[0] }, 2, dtype);
         },
+        .trailing_axis => blk: {
+            if (t.n_dims + 1 > shape_buf.len) return error.BadShape;
+            shape_buf[t.n_dims] = 1;
+            shape = shape_buf[0 .. t.n_dims + 1];
+            break :blk mlx.mlx_array_new_data(t.data.ptr, shape.ptr, @intCast(shape.len), dtype);
+        },
+        .minus_one, .neg_log => blk: {
+            if (t.ty != .f32) return error.UnsupportedTensor;
+            const tmp = try allocator.alloc(f32, t.elems());
+            defer allocator.free(tmp);
+            for (tmp, std.mem.bytesAsSlice(f32, t.data)) |*o, v| o.* = if (transform == .neg_log) @log(-v) else v - 1;
+            const flat = [_]c_int{@intCast(t.elems())};
+            break :blk mlx.mlx_array_new_data(tmp.ptr, if (transform == .neg_log) &flat else shape.ptr, if (transform == .neg_log) 1 else @intCast(shape.len), dtype);
+        },
+        .flatten => mlx.mlx_array_new_data(t.data.ptr, &[_]c_int{@intCast(t.elems())}, 1, dtype),
+        .split_ba => return error.UnsupportedTensor,
         // Un-tiling only moves bytes, so it works the same on any float type.
         .untile_rows, .untile_vec, .a_log, .conv1d, .tiled_input => blk: {
             const tmp = try allocator.alignedAlloc(u8, .@"4", t.data.len);
@@ -182,7 +219,7 @@ fn loadFloat(allocator: std.mem.Allocator, t: gguf.Tensor, transform: arch_mod.T
         },
     };
     // A_log stays f32 like the reference checkpoints, the gate math runs in f32.
-    if (transform == .a_log or dtype == .bfloat16) return raw;
+    if (transform == .a_log or transform == .neg_log or dtype == .bfloat16) return raw;
     defer _ = mlx.mlx_array_free(raw);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -221,9 +258,17 @@ test "real model loads into a weight map (set MLX_SERVE_GGUF_TEST_MODEL)" {
     try load(a, &f, &map, s);
     try warmKernels(a, &map, s);
 
+    const arch = try Arch.read(&f);
     const p = "language_model.model.";
-    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(map.get(p ++ "norm.weight").?));
-    switch (try Arch.read(&f)) {
+    const prefix: []const u8 = switch (arch) {
+        .gemma3, .lfm2, .gpt_oss, .qwen3next => "model.",
+        .nemotron_h => "backbone.",
+        else => p,
+    };
+    const norm_name = try std.fmt.allocPrint(a, "{s}{s}norm{s}.weight", .{ prefix, if (arch == .lfm2) "embedding_" else "", if (arch == .nemotron_h) "_f" else "" });
+    defer a.free(norm_name);
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(map.get(norm_name).?));
+    switch (arch) {
         .qwen35 => |hp| {
             const qkv = map.get(p ++ "layers.0.linear_attn.in_proj_qkv.weight").?;
             try std.testing.expectEqual(@as(c_int, @intCast(2 * hp.nk * hp.dk + hp.nv * hp.dv)), mlx.getShape(qkv)[0]);
@@ -240,6 +285,28 @@ test "real model loads into a weight map (set MLX_SERVE_GGUF_TEST_MODEL)" {
             try std.testing.expectEqual(hp.ple_dim > 0, map.get(p ++ "layers.0.per_layer_input_gate.weight") != null);
             const q = map.get(p ++ "layers.0.self_attn.q_proj.weight").?;
             try std.testing.expectEqual(@as(c_int, @intCast(hp.n_heads * hp.head_dim)), mlx.getShape(q)[0]);
+        },
+        .lfm2 => |hp| {
+            try std.testing.expectEqualSlices(c_int, &.{ @intCast(hp.hidden), @intCast(hp.conv_cache), 1 }, mlx.getShape(map.get("model.layers.0.conv.conv.weight").?));
+            try std.testing.expectEqual(hp.moe, map.get("model.layers.2.feed_forward.switch_mlp.up_proj.weight") != null);
+        },
+        .qwen3next => |hp| {
+            try std.testing.expectEqualSlices(c_int, &.{@intCast(hp.nv)}, mlx.getShape(map.get("model.layers.0.linear_attn.A_log").?));
+            try std.testing.expectEqual(@as(c_int, @intCast(hp.nv)), mlx.getShape(map.get("model.layers.0.linear_attn.in_proj_b.weight").?)[0]);
+            try std.testing.expect(map.get("model.layers.0.linear_attn.in_proj_ba.weight") == null);
+        },
+        .nemotron_h => |hp| {
+            try std.testing.expectEqualSlices(c_int, &.{@intCast(hp.mamba_heads)}, mlx.getShape(map.get("backbone.layers.0.mixer.A_log").?));
+            try std.testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(map.get("backbone.layers.0.mixer.A_log").?));
+        },
+        .gpt_oss => |hp| {
+            try std.testing.expectEqualSlices(c_int, &.{@intCast(hp.n_heads)}, mlx.getShape(map.get("model.layers.0.self_attn.sinks").?));
+            try std.testing.expect(map.get("model.layers.0.mlp.experts.gate_proj.bias") != null);
+        },
+        .gemma3 => |hp| {
+            const q = map.get("model.layers.0.self_attn.q_proj.weight").?;
+            try std.testing.expectEqual(@as(c_int, @intCast(hp.n_heads * hp.head_dim)), mlx.getShape(q)[0]);
+            try std.testing.expect(map.get("model.layers.0.input_layernorm.weight") != null);
         },
     }
 }

@@ -14,7 +14,10 @@ const ITERS_TOKENS = 192;
 const WORKING_SET = 400 << 20;
 const MAX_COPIES = 32;
 
-const Shape = struct { name: []const u8, in: c_int, out: c_int };
+/// `experts` > 0: an expert bank, timed as MoE dispatch (top-8 sorted pairs
+/// per token) against MLX's gather_qmm.
+const Shape = struct { name: []const u8, in: c_int, out: c_int, experts: c_int = 0 };
+const TOP_K = 8;
 // Qwen3.5-4B layer shapes, the lm_head last.
 const shapes = [_]Shape{
     .{ .name = "ffn_up   2560->9216", .in = 2560, .out = 9216 },
@@ -30,6 +33,11 @@ const shapes = [_]Shape{
     .{ .name = "e2b attn_q   1536->2048", .in = 1536, .out = 2048 },
     .{ .name = "e2b attn_kv  1536->256", .in = 1536, .out = 256 },
     .{ .name = "e2b lm_head  1536->262144", .in = 1536, .out = 262144 },
+    // Qwen3.6-35B-A3B experts: 256 of them, 8 per token.
+    .{ .name = "moe gate/up 2048->512 x256", .in = 2048, .out = 512, .experts = 256 },
+    .{ .name = "moe down    512->2048 x256", .in = 512, .out = 2048, .experts = 256 },
+    // gpt-oss-20b experts: 32 of them, 4 per token (the bench routes 8).
+    .{ .name = "gptoss experts 2880->2880 x32", .in = 2880, .out = 2880, .experts = 32 },
 };
 const types = kernels.all_types;
 
@@ -66,6 +74,23 @@ fn ggufDequantMatmul(tyx: struct { GgmlType, mlx.mlx_array }, ws: []const mlx.ml
     return kernels.dequantMatmul(tyx[0], tyx[1], ws[i % ws.len], s);
 }
 
+fn ggufGather(tyx: struct { GgmlType, mlx.mlx_array, mlx.mlx_array }, ws: []const mlx.mlx_array, i: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    return kernels.gatherLinear(.{ .ty = tyx[0] }, tyx[1], ws[i % ws.len], .{ .ctx = null }, tyx[2], s);
+}
+
+fn mlxGatherQmm(xi: struct { mlx.mlx_array, mlx.mlx_array }, qs: []const [3]mlx.mlx_array, i: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    const q = qs[i % qs.len];
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_gather_qmm(&y, xi[0], q[0], q[1], q[2], .{ .ctx = null }, xi[1], true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", true, s));
+    return y;
+}
+
+fn mlxMatmul(x: mlx.mlx_array, ws: []const mlx.mlx_array, i: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_matmul(&y, x, ws[i % ws.len], s));
+    return y;
+}
+
 fn mlxQmv(x: mlx.mlx_array, qs: []const [3]mlx.mlx_array, i: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const q = qs[i % qs.len];
     var y = mlx.mlx_array_new();
@@ -89,24 +114,48 @@ pub fn main(init: std.process.Init) !void {
     const s = mlx.mlx_default_gpu_stream_new();
     var prng = std.Random.DefaultPrng.init(1);
 
+    // Per-op floor: a custom kernel over one block against MLX's own matmul on one row.
+    {
+        var tiny_bytes: [18]u8 = undefined;
+        prng.random().bytes(&tiny_bytes);
+        const tiny = [_]mlx.mlx_array{mlx.mlx_array_new_data(&tiny_bytes, &[_]c_int{ 1, 18 }, 2, .uint8)};
+        const xv1: [32]f32 = @splat(1);
+        const x1 = mlx.mlx_array_new_data(&xv1, &[_]c_int{ 1, 32 }, 2, .float32);
+        const custom_ms = try time(ggufMatvec, .{ .{ GgmlType.iq4_nl, x1 }, @as([]const mlx.mlx_array, &tiny), s }, s);
+        var wd = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&wd, &[_]c_int{ 32, 32 }, 2, .float32, 0, 1, .{ .ctx = null }, s));
+        const native = [_]mlx.mlx_array{wd};
+        const native_ms = try time(mlxMatmul, .{ x1, @as([]const mlx.mlx_array, &native), s }, s);
+        std.debug.print("per-op floor: custom kernel {d:.4} ms, mlx matmul {d:.4} ms\n", .{ custom_ms, native_ms });
+    }
     for (shapes) |sh| {
         if (m > 1 and sh.out > 100_000) continue; // no lm_head in prefill
         if (args.len > 3 and std.mem.indexOf(u8, sh.name, args[3]) == null) continue;
-        const xv = try a.alloc(f32, @intCast(sh.in * m));
+        // MoE: m tokens x TOP_K pairs, x rows gathered and ids sorted, like a prefill.
+        const pairs = m * TOP_K;
+        const x_rows = if (sh.experts > 0) pairs else m;
+        const xv = try a.alloc(f32, @intCast(sh.in * x_rows));
         defer a.free(xv);
         for (xv) |*v| v.* = prng.random().float(f32) - 0.5;
-        const x32 = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ m, sh.in }, 2, .float32);
+        const x_shape: []const c_int = if (sh.experts > 0) &.{ pairs, 1, sh.in } else &.{ m, sh.in };
+        const x32 = mlx.mlx_array_new_data(xv.ptr, x_shape.ptr, @intCast(x_shape.len), .float32);
         var x = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
         try mlx.check(mlx.mlx_array_eval(x));
+        const idv = try a.alloc(u32, @intCast(pairs));
+        defer a.free(idv);
+        for (idv, 0..) |*id, i| id.* = @intCast(i * @as(usize, @intCast(@max(sh.experts, 1))) / @as(usize, @intCast(pairs)));
+        const ids = mlx.mlx_array_new_data(idv.ptr, &[_]c_int{pairs}, 1, .uint32);
+        const n_banks: usize = @intCast(@max(sh.experts, 1));
 
         // Reference: MLX affine 4-bit gs64 on random dense weights.
-        const ref_bytes = @as(usize, @intCast(sh.in)) * @as(usize, @intCast(sh.out)) * 9 / 16;
+        const ref_bytes = @as(usize, @intCast(sh.in)) * @as(usize, @intCast(sh.out)) * 9 / 16 * n_banks;
         const qs = try a.alloc([3]mlx.mlx_array, copiesFor(ref_bytes));
         defer a.free(qs);
         for (qs) |*q| {
             var wd = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_random_normal(&wd, &[_]c_int{ sh.out, sh.in }, 2, .bfloat16, 0, 1, .{ .ctx = null }, s));
+            const w_shape: []const c_int = if (sh.experts > 0) &.{ sh.experts, sh.out, sh.in } else &.{ sh.out, sh.in };
+            try mlx.check(mlx.mlx_random_normal(&wd, w_shape.ptr, @intCast(w_shape.len), .bfloat16, 0, 1, .{ .ctx = null }, s));
             var qv = mlx.mlx_vector_array_new();
             try mlx.check(mlx.mlx_quantize(&qv, wd, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, s));
             for (q, 0..) |*p, i| {
@@ -117,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
             _ = mlx.mlx_vector_array_free(qv);
             _ = mlx.mlx_array_free(wd);
         }
-        const ref_ms = try time(mlxQmv, .{ x, @as([]const [3]mlx.mlx_array, qs), s }, s);
+        const ref_ms = if (sh.experts > 0) try time(mlxGatherQmm, .{ .{ x, ids }, @as([]const [3]mlx.mlx_array, qs), s }, s) else try time(mlxQmv, .{ x, @as([]const [3]mlx.mlx_array, qs), s }, s);
         std.debug.print("{s}\n  {s:<8} {d:>7.3} ms   (MLX affine 4-bit, reference, {d} copies)\n", .{ sh.name, "mlx-q4", ref_ms, qs.len });
         for (qs) |q| for (q) |p| {
             _ = mlx.mlx_array_free(p);
@@ -132,21 +181,22 @@ pub fn main(init: std.process.Init) !void {
                 } else continue;
             }
             const row_bytes = @as(usize, @intCast(sh.in)) / ty.blockElems() * ty.blockBytes();
-            const bytes = try a.alloc(u8, row_bytes * @as(usize, @intCast(sh.out)));
+            const bytes = try a.alloc(u8, row_bytes * @as(usize, @intCast(sh.out)) * n_banks);
             defer a.free(bytes);
             const ws = try a.alloc(mlx.mlx_array, copiesFor(bytes.len));
             defer a.free(ws);
             for (ws) |*w| {
                 prng.random().bytes(bytes);
-                w.* = mlx.mlx_array_new_data(bytes.ptr, &[_]c_int{ sh.out, @intCast(row_bytes) }, 2, .uint8);
+                const w_shape: []const c_int = if (sh.experts > 0) &.{ sh.experts, sh.out, @intCast(row_bytes) } else &.{ sh.out, @intCast(row_bytes) };
+                w.* = mlx.mlx_array_new_data(bytes.ptr, w_shape.ptr, @intCast(w_shape.len), .uint8);
             }
             defer for (ws) |w| {
                 _ = mlx.mlx_array_free(w);
             };
-            const ms = try time(ggufMatvec, .{ .{ ty, x }, @as([]const mlx.mlx_array, ws), s }, s);
+            const ms = if (sh.experts > 0) try time(ggufGather, .{ .{ ty, x, ids }, @as([]const mlx.mlx_array, ws), s }, s) else try time(ggufMatvec, .{ .{ ty, x }, @as([]const mlx.mlx_array, ws), s }, s);
             const bpw = @as(f64, @floatFromInt(ty.blockBytes() * 8)) / @as(f64, @floatFromInt(ty.blockElems()));
             std.debug.print("  {s:<8} {d:>7.3} ms   {d:>5.2}x ref   ({d:.2} bpw)", .{ @tagName(ty), ms, ms / ref_ms, bpw });
-            if (m > kernels.MATVEC_MAX_ROWS) {
+            if (m > kernels.MATVEC_MAX_ROWS and sh.experts == 0) {
                 const dq_ms = try time(ggufDequantMatmul, .{ .{ ty, x }, @as([]const mlx.mlx_array, ws), s }, s);
                 std.debug.print("   dequant+gemm {d:>7.3} ms {d:>5.2}x ref", .{ dq_ms, dq_ms / ref_ms });
             }

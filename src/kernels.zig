@@ -16,9 +16,43 @@ pub const MATVEC_MAX_ROWS = 8;
 /// tokens (an isolated `zig build bench -Dm=...` puts it lower, near 200).
 pub const TILE_MAX_ROWS = 384;
 
-const header = @embedFile("metal/iq_tables.h") ++ @embedFile("metal/blocks.h");
+/// The emitters, the decoder of one type and its codebooks: MLX hashes a
+/// kernel's whole source on every dispatch (~6 us for the 90 KB of every
+/// table and decoder together, measured), so a kernel carries only its own.
+fn headerFor(comptime ty: GgmlType) [:0]const u8 {
+    const parts: []const []const u8 = switch (ty) {
+        .q4_0, .q4_1, .q5_0, .q5_1 => &.{"blocks/q4_legacy"},
+        .q8_0 => &.{"blocks/q8_0"},
+        .mxfp4 => &.{"blocks/mxfp4"},
+        .q2_k, .q3_k, .q4_k, .q5_k, .q6_k => &.{"blocks/k_quants"},
+        .iq4_nl, .iq4_xs => &.{ "tables/kvalues_iq4nl", "blocks/iq4" },
+        .iq2_xxs => &.{ "tables/ksigns_iq2xs", "tables/iq2xxs_grid", "blocks/iq2_xxs" },
+        .iq2_xs => &.{ "tables/ksigns_iq2xs", "tables/iq2xs_grid", "blocks/iq2_xs" },
+        .iq2_s => &.{ "tables/iq2s_grid", "blocks/iq2_s" },
+        .iq3_xxs => &.{ "tables/ksigns_iq2xs", "tables/iq3xxs_grid", "blocks/iq3_xxs" },
+        .iq3_s => &.{ "tables/iq3s_grid", "blocks/iq3_s" },
+        .iq1_s, .iq1_m => &.{ "tables/iq1s_grid_gpu", "blocks/iq1" },
+        else => unreachable,
+    };
+    comptime var h: [:0]const u8 = @embedFile("metal/blocks/common.h");
+    inline for (parts) |p| h = h ++ @embedFile("metal/" ++ p ++ ".h");
+    return h;
+}
 
-const Kind = enum { dequant, matvec, gather, matmat };
+const Kind = enum { dequant, matvec, gather, matmat, gather_tile };
+
+/// Runs the tile for this threadgroup's token tile: the last tile of a prompt
+/// may hold fewer 8-token groups.
+const tile_dispatch =
+    \\{
+    \\    const uint tail = (uint(x_shape[0]) / 8) % (TILE_TOKENS / 8);
+    \\    if (tail == 0 || threadgroup_position_in_grid.y + 1 < threadgroups_per_grid.y) GG_TILE(4)
+    \\    else if (tail == 1) GG_TILE(1)
+    \\    else if (tail == 2) GG_TILE(2)
+    \\    else GG_TILE(3)
+    \\}
+    \\
+;
 
 /// Weight rows per simdgroup of the matvec, for `per` activation rows per
 /// kernel instance. Many short threads pull more memory bandwidth than one
@@ -43,6 +77,12 @@ fn rowsPerInstance(m: c_int) c_int {
 }
 const SIMDGROUPS = 2;
 const SIMD_WIDTH = 32;
+/// Simdgroups a decode matvec should put in flight before it starts packing rows.
+const MIN_SIMDGROUPS = 512;
+/// MoE prefill: (token, expert) pairs per expert from which the bank is
+/// materialized for gather_mm, and the largest bf16 bank that gets.
+const DEQUANT_MOE_PAIRS_PER_EXPERT = 24;
+const DEQUANT_MOE_MAX_BYTES: u64 = 1 << 30;
 
 /// Tokens per tile of the matmat kernel.
 const TILE_TOKENS = 32;
@@ -51,24 +91,28 @@ const TILE_TOKENS = 32;
 /// compile-time constant: with a runtime bound the accumulators spill and the
 /// kernel runs 4x slower (measured). ~18 live simdgroup matrices is the
 /// register budget, so no hoisting the wm loads and no 64-token tiles either.
+/// GG_W = the weight matrix, GG_STORE(t, g) = where 8x8 block (t, g) of the
+/// result goes, [GG_T0, GG_T1) the 8-token groups to multiply (the rest
+/// keep their zeros; the loop bound stays GR so the accumulators stay in
+/// registers).
 const tile_macro = blk: {
     const body =
         \\#define GG_TILE(GR) {
         \\    const uint lid = thread_index_in_threadgroup;
         \\    const uint r0 = threadgroup_position_in_grid.x * TILE_ROWS;
         \\    const uint m0 = threadgroup_position_in_grid.y * TILE_TOKENS;
-        \\    const uint nb = K / BE;
         \\    simdgroup_float8x8 acc[GR][TILE_ROWS / 8];
         \\    for (uint t = 0; t < GR; t++)
         \\        for (uint g = 0; g < TILE_ROWS / 8; g++) acc[t][g] = simdgroup_float8x8(0.0f);
         \\    for (uint u = 0; u < K / UNIT; u++) {
         \\        if (lid < TILE_ROWS) {
         \\            GgTile o = {tile + (lid / 8) * 8 * UNIT, lid % 8};
-        \\            DEQ(w + (size_t(r0 + lid) * nb + u / UPB) * BB, u % UPB, o);
+        \\            DEQ(GG_W + (size_t(r0 + lid) * (K / BE) + u / UPB) * BB, u % UPB, o);
         \\        }
         \\        threadgroup_barrier(mem_flags::mem_threadgroup);
         \\        for (uint c = 0; c < UNIT; c += 8) {
         \\            for (uint t = 0; t < GR; t++) {
+        \\                if (t < GG_T0 || t >= GG_T1) continue;
         \\                simdgroup_float8x8 xm;
         \\                simdgroup_load(xm, x + size_t(m0 + 8 * t) * K + u * UNIT + c, K);
         \\                for (uint g = 0; g < TILE_ROWS / 8; g++) {
@@ -79,8 +123,10 @@ const tile_macro = blk: {
         \\            }
         \\        }
         \\    }
-        \\    for (uint t = 0; t < GR; t++)
-        \\        for (uint g = 0; g < TILE_ROWS / 8; g++) simdgroup_store(acc[t][g], out + size_t(m0 + 8 * t) * N + r0 + 8 * g, N);
+        \\    for (uint t = 0; t < GR; t++) {
+        \\        if (t < GG_T0 || t >= GG_T1) continue;
+        \\        for (uint g = 0; g < TILE_ROWS / 8; g++) GG_STORE(t, g);
+        \\    }
         \\}
     ;
     @setEvalBranchQuota(100_000);
@@ -163,12 +209,41 @@ fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
         // group multiplies 8x8 blocks against x. The last tile of a prompt may
         // hold fewer 8-token groups.
         .matmat => "threadgroup float tile[TILE_ROWS * UNIT];\n" ++ tile_macro ++
-            \\const uint tile_y = threadgroup_position_in_grid.y;
-            \\const uint tail = (uint(x_shape[0]) / 8) % (TILE_TOKENS / 8);
-            \\if (tail == 0 || tile_y + 1 < threadgroups_per_grid.y) GG_TILE(4)
-            \\else if (tail == 1) GG_TILE(1)
-            \\else if (tail == 2) GG_TILE(2)
-            \\else GG_TILE(3)
+            \\#define GG_W w
+            \\#define GG_STORE(t, g) simdgroup_store(acc[t][g], out + size_t(m0 + 8 * t) * N + r0 + 8 * g, N)
+            \\#define GG_T0 0u
+            \\#define GG_T1 4u
+            \\
+        ++ tile_dispatch,
+        // MoE prefill: x [M, K] f32 holds the rows already gathered per
+        // (token, expert) pair, `ids` [rows of x, unpadded] their experts, as
+        // the sorted gather_qmm layout. A token tile runs the tile routine once
+        // per distinct expert in it, over just the 8-token groups that hold
+        // its rows, into a staging buffer, and the rows of that expert are
+        // copied out. Every real row belongs to exactly one pass, the zero
+        // pad rows to none.
+        .gather_tile => "threadgroup float tile[TILE_ROWS * UNIT];\nthreadgroup float stage[TILE_TOKENS * TILE_ROWS];\n" ++ tile_macro ++
+            \\#define GG_W we
+            \\#define GG_STORE(t, g) simdgroup_store(acc[t][g], stage + (8 * t) * TILE_ROWS + 8 * g, TILE_ROWS)
+            \\#define GG_T0 (lo / 8)
+            \\#define GG_T1 (hi / 8 + 1)
+            \\const uint lid = thread_index_in_threadgroup;
+            \\const uint r0 = threadgroup_position_in_grid.x * TILE_ROWS;
+            \\const uint m0 = threadgroup_position_in_grid.y * TILE_TOKENS;
+            \\const uint m_end = min(m0 + TILE_TOKENS, uint(ids_shape[0]));
+            \\for (uint m = m0; m < m_end; m++) {
+            \\    const uint e = ids[m];
+            \\    uint lo = TILE_TOKENS, hi = 0;
+            \\    for (uint p = m0; p < m_end; p++) if (ids[p] == e) { lo = min(lo, p - m0); hi = max(hi, p - m0); }
+            \\    if (lo < m - m0) continue;
+            \\    const device uint8_t *we = w + size_t(e) * N * (K / BE) * BB;
+            \\
+        ++ tile_dispatch ++
+            \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+            \\    if (m0 + lid < m_end && ids[m0 + lid] == e)
+            \\        for (uint c = 0; c < TILE_ROWS; c++) out[size_t(m0 + lid) * N + r0 + c] = stage[lid * TILE_ROWS + c];
+            \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+            \\}
         ,
     };
 }
@@ -186,7 +261,7 @@ fn kernelFor(comptime kind: Kind, comptime ty: GgmlType) Error!mlx.mlx_fast_meta
     const input_names: []const [*:0]const u8 = switch (kind) {
         .dequant => &.{"w"},
         .matvec, .matmat => &.{ "x", "w" },
-        .gather => &.{ "x", "w", "ids" },
+        .gather, .gather_tile => &.{ "x", "w", "ids" },
     };
     const output_names = [_][*:0]const u8{"out"};
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
@@ -198,7 +273,7 @@ fn kernelFor(comptime kind: Kind, comptime ty: GgmlType) Error!mlx.mlx_fast_meta
         in_vec,
         out_vec,
         comptime source(kind, ty),
-        header,
+        comptime headerFor(ty),
         true,
         false,
     );
@@ -208,7 +283,7 @@ fn kernelFor(comptime kind: Kind, comptime ty: GgmlType) Error!mlx.mlx_fast_meta
 }
 
 /// Every type with a decoder in metal/blocks.h.
-pub const all_types = [_]GgmlType{ .q8_0, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq2_xxs, .iq2_xs, .iq2_s, .iq3_xxs, .iq3_s, .iq4_nl, .iq4_xs, .iq1_s, .iq1_m };
+pub const all_types = [_]GgmlType{ .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .mxfp4, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq2_xxs, .iq2_xs, .iq2_s, .iq3_xxs, .iq3_s, .iq4_nl, .iq4_xs, .iq1_s, .iq1_m };
 
 fn kernel(kind: Kind, ty: GgmlType) Error!mlx.mlx_fast_metal_kernel {
     inline for (all_types) |t| {
@@ -269,7 +344,9 @@ fn geometry(ty: GgmlType, w: mlx.mlx_array) Error!struct { rows: c_int, in: c_in
 /// of every output, `lhs_idx` (optional, same size) its row of x. Without it
 /// x's rows have to lead rhs_idx's dims (decode: x [B, S, 1, 1, in] against
 /// [B, S, top_k] experts). Returns rhs_idx's shape + [1, rows].
-/// Every (token, expert) pair is a matvec, prefill included.
+/// Decode runs a matvec per (token, expert) pair; past MATVEC_MAX_ROWS pairs
+/// with x's rows already gathered (prefill), the tile kernel decodes each
+/// expert's weights once per token tile instead of once per pair.
 pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const ty = info.ty;
     const ws = mlx.getShape(w);
@@ -313,6 +390,57 @@ pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx
     defer _ = mlx.mlx_array_free(ids);
     try mlx.check(mlx.mlx_astype(&ids, rhs_idx, .uint32, s));
 
+    // Long prefills: materialize the bank once and let MLX's gather_mm do the
+    // GEMMs. The decode costs one pass over the bank, the tile kernel one per
+    // (expert, token tile); past ~16 pairs per expert the pass is cheaper
+    // (bench: 3.6x at 1700 tokens x 8 experts of 256), as long as the bf16
+    // bank stays under a GB.
+    const bank_bytes = @as(u64, @intCast(ws[0])) * @as(u64, @intCast(rows)) * @as(u64, @intCast(in)) * 2;
+    if (xdiv == 1 and n_out >= DEQUANT_MOE_PAIRS_PER_EXPERT * ws[0] and bank_bytes <= DEQUANT_MOE_MAX_BYTES) {
+        var flat_w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat_w);
+        try mlx.check(mlx.mlx_reshape(&flat_w, w, &[_]c_int{ ws[0] * rows, ws[2] }, 2, s));
+        const wd = try dequantize(ty, flat_w, mlx.mlx_array_dtype(x), s);
+        defer _ = mlx.mlx_array_free(wd);
+        var bank = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bank);
+        try mlx.check(mlx.mlx_reshape(&bank, wd, &[_]c_int{ ws[0], rows, in }, 3, s));
+        var bank_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bank_t);
+        try mlx.check(mlx.mlx_transpose_axes(&bank_t, bank, &[_]c_int{ 0, 2, 1 }, 3, s));
+        var x3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x3);
+        try mlx.check(mlx.mlx_reshape(&x3, x_in, &[_]c_int{ n_out, 1, in }, 3, s));
+        var ids_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_flat);
+        try mlx.check(mlx.mlx_reshape(&ids_flat, ids, &[_]c_int{n_out}, 1, s));
+        var y3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y3);
+        try mlx.check(mlx.mlx_gather_mm(&y3, x3, bank_t, .{ .ctx = null }, ids_flat, true, s));
+        var y = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_reshape(&y, y3, &out_shape, os.len + 2, s));
+        return y;
+    }
+
+    // The tile kernel pays one weight decode per (expert, token tile) but runs
+    // few threadgroups; it wins once an expert averages a whole 8-token group
+    // per tile (256 experts: ~256 prompt tokens, measured, see bench).
+    if (xdiv == 1 and n_out >= 8 * ws[0] and @mod(rows, tileRows(ty)) == 0) {
+        var x2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x2);
+        try mlx.check(mlx.mlx_reshape(&x2, x_in, &[_]c_int{ n_out, in }, 2, s));
+        var ids_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_flat);
+        try mlx.check(mlx.mlx_reshape(&ids_flat, ids, &[_]c_int{n_out}, 1, s));
+        const y2 = try tileGlue(.gather_tile, ty, x2, &.{ w, ids_flat }, rows, s);
+        defer _ = mlx.mlx_array_free(y2);
+        var y = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_reshape(&y, y2, &out_shape, os.len + 2, s));
+        return y;
+    }
+
     const rpt = matvecRows(1);
     const groups = @divFloor(rows + rpt * SIMDGROUPS - 1, rpt * SIMDGROUPS);
     return apply(try kernel(.gather, ty), &.{ x_in, w, ids }, out_shape[0 .. os.len + 2], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, n_out }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &.{ .{ "K", in }, .{ "N", rows }, .{ "M", 1 }, .{ "RPT", rpt }, .{ "XDIV", xdiv } }, s);
@@ -335,7 +463,11 @@ pub fn matvec(ty: GgmlType, x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_strea
     out_shape[xs.len - 1] = g.rows;
     const m: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(g.in))));
     const per = rowsPerInstance(m);
-    const rpt = matvecRows(per);
+    // Small weights are latency bound, not bandwidth bound: fewer rows per
+    // simdgroup puts more of them in flight (E2B's 1536->256 projection goes
+    // from 9 to 4 us on an M4 Max, the big matrices keep RPT = 8, measured).
+    var rpt = matvecRows(per);
+    while (rpt > 1 and @divFloor(g.rows, rpt) < MIN_SIMDGROUPS) rpt = @divExact(rpt, 2);
     const groups = @divFloor(g.rows + rpt * SIMDGROUPS - 1, rpt * SIMDGROUPS);
     return apply(try kernel(.matvec, ty), &.{ x, w }, out_shape[0..xs.len], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, @divExact(m, per) }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &.{ .{ "K", g.in }, .{ "N", g.rows }, .{ "M", per }, .{ "RPT", rpt } }, s);
 }
@@ -349,22 +481,32 @@ pub fn matvec(ty: GgmlType, x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_strea
 pub fn matmat(ty: GgmlType, x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const g = try geometry(ty, w);
     const xs = mlx.getShape(x);
-    const tr = tileRows(ty);
-    if (xs.len != 2 or xs[1] != g.in or @mod(g.rows, tr) != 0) return error.BadShape;
+    if (xs.len != 2 or xs[1] != g.in or @mod(g.rows, tileRows(ty)) != 0) return error.BadShape;
+    return tileGlue(.matmat, ty, x, &.{w}, g.rows, s);
+}
+
+/// x [M, K] through a tile kernel whose inputs after x are `rest`, rows a
+/// multiple of tileRows. The glue around the kernel, see `matmat`.
+fn tileGlue(comptime kind: Kind, ty: GgmlType, x: mlx.mlx_array, rest: []const mlx.mlx_array, rows: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const xs = mlx.getShape(x);
     const m = xs[0];
+    const k = xs[1];
     const m_pad = @divFloor(m + 7, 8) * 8;
     const dtype = mlx.mlx_array_dtype(x);
     const glue = dtype != .float32 or m_pad != m;
 
-    const x32 = if (glue) try apply(try glueKernel(.prep), &.{x}, &.{ m_pad, g.in }, .float32, .{ g.in, m_pad, 1 }, .{ @min(g.in, 64), 1, 1 }, &.{}, s) else x;
+    const x32 = if (glue) try apply(try glueKernel(.prep), &.{x}, &.{ m_pad, k }, .float32, .{ k, m_pad, 1 }, .{ @min(k, 64), 1, 1 }, &.{}, s) else x;
     defer if (glue) {
         _ = mlx.mlx_array_free(x32);
     };
-    const y32 = try apply(try kernel(.matmat, ty), &.{ x32, w }, &.{ m_pad, g.rows }, .float32, .{ SIMD_WIDTH * @divExact(g.rows, tr), @divFloor(m_pad + TILE_TOKENS - 1, TILE_TOKENS), 1 }, .{ SIMD_WIDTH, 1, 1 }, &.{ .{ "K", g.in }, .{ "N", g.rows } }, s);
+    var inputs: [3]mlx.mlx_array = undefined;
+    inputs[0] = x32;
+    @memcpy(inputs[1 .. 1 + rest.len], rest);
+    const y32 = try apply(try kernel(kind, ty), inputs[0 .. 1 + rest.len], &.{ m_pad, rows }, .float32, .{ SIMD_WIDTH * @divExact(rows, tileRows(ty)), @divFloor(m_pad + TILE_TOKENS - 1, TILE_TOKENS), 1 }, .{ SIMD_WIDTH, 1, 1 }, &.{ .{ "K", k }, .{ "N", rows } }, s);
     if (!glue) return y32;
     defer _ = mlx.mlx_array_free(y32);
-    const n_out = m * g.rows;
-    return apply(try glueKernel(.finish), &.{y32}, &.{ m, g.rows }, dtype, .{ n_out, 1, 1 }, .{ @min(n_out, 64), 1, 1 }, &.{}, s);
+    const n_out = m * rows;
+    return apply(try glueKernel(.finish), &.{y32}, &.{ m, rows }, dtype, .{ n_out, 1, 1 }, .{ @min(n_out, 64), 1, 1 }, &.{}, s);
 }
 
 const Glue = enum { prep, finish };
@@ -658,6 +800,60 @@ test "gatherLinear routes every output to its expert, with and without lhs indic
                 }
                 try std.testing.expectApproxEqAbs(want, got[t * 2 + r], 1e-5 * scale);
             };
+        }
+    }
+}
+
+test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals a CPU dot product" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var prng = std.Random.DefaultPrng.init(29);
+    inline for ([_]GgmlType{ .iq4_nl, .q6_k, .iq2_xxs }) |ty| {
+        // 4 experts x 32 rows of one block each; expert e's row r is fixture block (r + e) % 4.
+        const be = ty.blockElems();
+        const bb = ty.blockBytes();
+        const data = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin");
+        const n_exp = 4;
+        const n_rows = 32;
+        var bytes: [n_exp * n_rows * 256]u8 = undefined;
+        for (0..n_exp) |e| for (0..n_rows) |r| @memcpy(bytes[(e * n_rows + r) * bb ..][0..bb], data[((r + e) % 4) * bb ..][0..bb]);
+        var ref: [4 * 256]f32 = undefined;
+        try quants.dequantize(ty, data[0 .. 4 * bb], ref[0 .. 4 * be]);
+        const bank = mlx.mlx_array_new_data(&bytes, &[_]c_int{ n_exp, n_rows, @intCast(bb) }, 3, .uint8);
+        defer _ = mlx.mlx_array_free(bank);
+
+        // 41 rows: the tile path (one whole tile plus a padded one); 80: the
+        // materialized-bank path. Sorted ids first, then a shuffled copy.
+        inline for ([_]usize{ 41, 80 }) |m| {
+            var ids: [m]u32 = undefined;
+            for (&ids, 0..) |*id, i| id.* = @intCast(i * n_exp / m);
+            var shuffled = ids;
+            prng.random().shuffle(u32, &shuffled);
+            const xv = try std.testing.allocator.alloc(f32, m * be);
+            defer std.testing.allocator.free(xv);
+            for (xv) |*v| v.* = prng.random().float(f32) - 0.5;
+            const x = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ m, 1, @intCast(be) }, 3, .float32);
+            defer _ = mlx.mlx_array_free(x);
+            for ([_][]const u32{ &ids, &shuffled }) |order| {
+                const rhs = mlx.mlx_array_new_data(order.ptr, &[_]c_int{m}, 1, .uint32);
+                defer _ = mlx.mlx_array_free(rhs);
+                const y = try gatherLinear(.{ .ty = ty }, x, bank, .{ .ctx = null }, rhs, s);
+                defer _ = mlx.mlx_array_free(y);
+                try std.testing.expectEqualSlices(c_int, &.{ m, 1, n_rows }, mlx.getShape(y));
+                const got = try readF32(y, m * n_rows);
+                for (order, 0..) |e, t| for (0..n_rows) |r| {
+                    var want: f32 = 0;
+                    var scale: f32 = 0;
+                    for (xv[t * be ..][0..be], ref[((r + e) % 4) * be ..][0..be]) |a, b| {
+                        want += a * b;
+                        scale += @abs(a * b);
+                    }
+                    if (@abs(want - got[t * n_rows + r]) > 1e-5 * scale) {
+                        std.debug.print("{s} m={d} token {d} expert {d} row {d}: got {d} want {d}\n", .{ @tagName(ty), m, t, e, r, got[t * n_rows + r], want });
+                        return error.TestUnexpectedResult;
+                    }
+                };
+            }
         }
     }
 }

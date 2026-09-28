@@ -8,6 +8,10 @@ const tables = @import("iq_tables.zig");
 pub const GgmlType = enum(u32) {
     f32 = 0,
     f16 = 1,
+    q4_0 = 2,
+    q4_1 = 3,
+    q5_0 = 6,
+    q5_1 = 7,
     q8_0 = 8,
     q2_k = 10,
     q3_k = 11,
@@ -24,6 +28,7 @@ pub const GgmlType = enum(u32) {
     iq4_xs = 23,
     iq1_m = 29,
     bf16 = 30,
+    mxfp4 = 39,
     _,
 
     pub fn supported(self: GgmlType) bool {
@@ -34,7 +39,7 @@ pub const GgmlType = enum(u32) {
     pub fn blockElems(self: GgmlType) usize {
         return switch (self) {
             .f32, .f16, .bf16 => 1,
-            .q8_0, .iq4_nl => 32,
+            .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .iq4_nl, .mxfp4 => 32,
             .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .iq2_s, .iq4_xs, .iq1_s, .iq1_m => 256,
             _ => 0,
         };
@@ -45,6 +50,10 @@ pub const GgmlType = enum(u32) {
         return switch (self) {
             .f32 => 4,
             .f16, .bf16 => 2,
+            .q4_0 => 18,
+            .q4_1 => 20,
+            .q5_0 => 22,
+            .q5_1 => 24,
             .q8_0 => 34,
             .q2_k => 84,
             .q3_k => 110,
@@ -58,6 +67,7 @@ pub const GgmlType = enum(u32) {
             .iq2_s => 82,
             .iq2_xs => 74,
             .iq4_xs => 136,
+            .mxfp4 => 17,
             .iq1_s => 50,
             .iq1_m => 56,
             _ => 0,
@@ -91,6 +101,10 @@ pub fn dequantize(ty: GgmlType, src: []const u8, dst: []f32) Error!void {
         const blk = src[i * bb ..][0..bb];
         const y = dst[i * be ..][0..be];
         switch (ty) {
+            .q4_0 => q4_0(blk, y, -8, 0, 2),
+            .q4_1 => q4_0(blk, y, 0, half(blk, 2), 4),
+            .q5_0 => q5_0(blk, y, -16, 0, 6),
+            .q5_1 => q5_0(blk, y, 0, half(blk, 2), 8),
             .q8_0 => q8_0(blk, y),
             .q2_k => q2K(blk, y),
             .q3_k => q3K(blk, y),
@@ -106,6 +120,7 @@ pub fn dequantize(ty: GgmlType, src: []const u8, dst: []f32) Error!void {
             .iq2_xs => iq2Xs(blk, y),
             .iq1_s => iq1S(blk, y),
             .iq1_m => iq1M(blk, y),
+            .mxfp4 => mxfp4(blk, y),
             else => unreachable,
         }
     }
@@ -126,6 +141,39 @@ fn gridByte(entry: anytype, j: usize) f32 {
 
 fn sign(bits: u8, j: usize) f32 {
     return if (bits & tables.kmask_iq2xs[j] != 0) -1.0 else 1.0;
+}
+
+/// Q4_0 / Q4_1: 16 nibble bytes at `qs`, low nibbles first; y = (q + off) * d + m.
+fn q4_0(b: []const u8, y: []f32, off: f32, m: f32, qs: usize) void {
+    const d = half(b, 0);
+    for (b[qs..][0..16], 0..) |q, j| {
+        y[j] = (int(q & 0xF) + off) * d + m;
+        y[j + 16] = (int(q >> 4) + off) * d + m;
+    }
+}
+
+/// Q5_0 / Q5_1: fifth bits in the u32 before the nibbles, bit j for weight j, bit j + 16 for weight j + 16.
+fn q5_0(b: []const u8, y: []f32, off: f32, m: f32, qs: usize) void {
+    const d = half(b, 0);
+    const qh = std.mem.readInt(u32, b[qs - 4 ..][0..4], .little);
+    for (b[qs..][0..16], 0..) |q, j| {
+        const sh: u5 = @intCast(j);
+        y[j] = (int((q & 0xF) | @as(u8, @truncate(((qh >> sh) << 4) & 0x10))) + off) * d + m;
+        y[j + 16] = (int((q >> 4) | @as(u8, @truncate((qh >> (sh + 12)) & 0x10))) + off) * d + m;
+    }
+}
+
+const kvalues_fp4 = [16]i8{ 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+
+/// One E8M0 scale byte (ggml scales it by half) and 16 bytes of FP4 nibbles, low nibbles first.
+fn mxfp4(b: []const u8, y: []f32) void {
+    const e = b[0];
+    const bits: u32 = if (e < 2) @as(u32, 0x00200000) << @intCast(e) else @as(u32, e - 1) << 23;
+    const d: f32 = @bitCast(bits);
+    for (b[1..17], 0..) |q, j| {
+        y[j] = int(kvalues_fp4[q & 0xF]) * d;
+        y[j + 16] = int(kvalues_fp4[q >> 4]) * d;
+    }
 }
 
 fn q8_0(b: []const u8, y: []f32) void {
@@ -402,6 +450,10 @@ fn expectMatchesGgml(ty: GgmlType, comptime fixture: []const u8) !void {
 }
 
 test "dequant matches ggml for every supported type" {
+    try expectMatchesGgml(.q4_0, "q4_0.bin");
+    try expectMatchesGgml(.q4_1, "q4_1.bin");
+    try expectMatchesGgml(.q5_0, "q5_0.bin");
+    try expectMatchesGgml(.q5_1, "q5_1.bin");
     try expectMatchesGgml(.q8_0, "q8_0.bin");
     try expectMatchesGgml(.q2_k, "q2_k.bin");
     try expectMatchesGgml(.q3_k, "q3_k.bin");
@@ -417,6 +469,7 @@ test "dequant matches ggml for every supported type" {
     try expectMatchesGgml(.iq2_xs, "iq2_xs.bin");
     try expectMatchesGgml(.iq1_s, "iq1_s.bin");
     try expectMatchesGgml(.iq1_m, "iq1_m.bin");
+    try expectMatchesGgml(.mxfp4, "mxfp4.bin");
 }
 
 test "dequantize rejects a short buffer and unknown types" {

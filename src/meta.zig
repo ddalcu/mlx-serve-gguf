@@ -38,21 +38,51 @@ const TokenizerKind = struct {
     model_fields: []const u8 = "",
     /// A token HF lists as special that the GGUF types as a normal one.
     also_special: []const u8 = "",
+    /// A SentencePiece vocab without merges: user-defined tokens keep their
+    /// spaces as "\u2581" and the merges are derived from the scores the way
+    /// HF's converter does it.
+    spm: bool = false,
+
+    const gemma_head =
+        \\"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"\u2581"},
+        \\"pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},
+        \\"decoder":{"type":"Sequence","decoders":[{"type":"Replace","pattern":{"String":"\u2581"},"content":" "},{"type":"ByteFallback"},{"type":"Fuse"}]},
+    ;
+    const gemma_model_fields =
+        \\"unk_token":"<unk>","fuse_unk":true,"byte_fallback":true,
+    ;
 
     fn of(f: *const gguf.File) ?TokenizerKind {
         const model = f.getString("tokenizer.ggml.model") orelse return null;
-        if (std.mem.eql(u8, model, "gemma4")) return .{
+        if (std.mem.eql(u8, model, "gemma4")) return .{ .head = gemma_head, .model_fields = gemma_model_fields, .also_special = "<eos>" };
+        const arch_name = f.getString("general.architecture") orelse return null;
+        if (std.mem.eql(u8, model, "llama") and std.mem.eql(u8, arch_name, "gemma3")) return .{ .head = gemma_head, .model_fields = gemma_model_fields, .also_special = "<eos>", .spm = true };
+        const pre = f.getString("tokenizer.ggml.pre") orelse return null;
+        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "gpt-4o")) return .{
             .head =
-            \\"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"\u2581"},
-            \\"pre_tokenizer":{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false},
-            \\"decoder":{"type":"Sequence","decoders":[{"type":"Replace","pattern":{"String":"\u2581"},"content":" "},{"type":"ByteFallback"},{"type":"Fuse"}]},
+            \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
+            \\"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
             ,
             .model_fields =
-            \\"unk_token":"<unk>","fuse_unk":true,"byte_fallback":true,
+            \\"ignore_merges":true,
             ,
-            .also_special = "<eos>",
         };
-        const pre = f.getString("tokenizer.ggml.pre") orelse return null;
+        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "pixtral")) return .{
+            .head =
+            \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
+            \\"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+            ,
+            .model_fields =
+            \\"ignore_merges":true,
+            ,
+        };
+        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "qwen2")) return .{ .head =
+        \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        };
+        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "lfm2")) return .{ .head =
+        \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
+        \\"decoder":{"type":"Sequence","decoders":[{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true}]},
+        };
         if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "qwen35")) return .{ .head =
         \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
         };
@@ -70,7 +100,8 @@ pub fn tokenizerJson(allocator: std.mem.Allocator, f: *const gguf.File) ![]u8 {
     const kind = TokenizerKind.of(f) orelse return error.UnsupportedTokenizer;
     const tokens = f.getArray("tokenizer.ggml.tokens") orelse return error.MissingMetadata;
     const types = f.getArray("tokenizer.ggml.token_type") orelse return error.MissingMetadata;
-    const merges = f.getArray("tokenizer.ggml.merges") orelse return error.MissingMetadata;
+    const merges = f.getArray("tokenizer.ggml.merges");
+    if (merges == null and !kind.spm) return error.MissingMetadata;
     if (types.len != tokens.len) return error.BadMetadata;
 
     var out: std.ArrayList(u8) = .empty;
@@ -89,26 +120,29 @@ pub fn tokenizerJson(allocator: std.mem.Allocator, f: *const gguf.File) ![]u8 {
     while (it.next()) |tok| : (id += 1) {
         const ty = types.int(id);
         const special = ty == TOKEN_CONTROL or (kind.also_special.len > 0 and std.mem.eql(u8, tok, kind.also_special));
+        const spaces = kind.spm and ty == TOKEN_USER_DEFINED;
         if (special or ty == TOKEN_USER_DEFINED) {
             if (added.items.len > 0) try added.append(allocator, ',');
             try added.print(allocator, "{{\"id\":{d},\"special\":{},\"content\":", .{ id, special });
-            try appendJsonString(allocator, &added, tok);
+            try appendJsonToken(allocator, &added, tok, spaces);
             try added.append(allocator, '}');
             continue;
         }
         if (!first) try out.append(allocator, ',');
         first = false;
-        try appendJsonString(allocator, &out, tok);
+        try appendJsonToken(allocator, &out, tok, spaces);
         try out.print(allocator, ":{d}", .{id});
     }
     try out.appendSlice(allocator, "},\"merges\":[");
-    var mit = merges.strings();
-    first = true;
-    while (mit.next()) |m| {
-        if (!first) try out.append(allocator, ',');
-        first = false;
-        try appendJsonString(allocator, &out, m);
-    }
+    if (merges) |arr| {
+        var mit = arr.strings();
+        first = true;
+        while (mit.next()) |m| {
+            if (!first) try out.append(allocator, ',');
+            first = false;
+            try appendJsonString(allocator, &out, m);
+        }
+    } else try appendDerivedMerges(allocator, &out, tokens, types, f.getArray("tokenizer.ggml.scores") orelse return error.MissingMetadata);
     try out.appendSlice(allocator, "]},\"added_tokens\":[");
     try out.appendSlice(allocator, added.items);
     try out.appendSlice(allocator, "]}");
@@ -159,6 +193,120 @@ fn tokenById(f: *const gguf.File, id: ?i64) ?[]const u8 {
     for (0..want) |_| _ = it.next();
     return it.next();
 }
+
+/// A token's text; user-defined SentencePiece tokens spell their spaces "\u2581" (HF's vocab form).
+fn appendJsonToken(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tok: []const u8, spaces_as_underscore: bool) !void {
+    if (!spaces_as_underscore) return appendJsonString(allocator, out, tok);
+    const mapped = try std.mem.replaceOwned(u8, allocator, tok, " ", "\xe2\x96\x81");
+    defer allocator.free(mapped);
+    return appendJsonString(allocator, out, mapped);
+}
+
+const Merge = struct { tok: u32, split: u32, l: u32, r: u32, score: f32, len_l: u32, len_r: u32 };
+
+fn cpLen(s: []const u8) u32 {
+    var n: u32 = 0;
+    for (s) |c| n += @intFromBool(c & 0xC0 != 0x80);
+    return n;
+}
+
+/// The BPE merges HF's SentencePiece converter derives from a vocab with
+/// scores (transformers' `generate_merges` with `vocab_scores`): every split of
+/// a token into two vocab pieces is a merge, listed per token by (left id,
+/// right id), then all of them by score, longest left then right piece first
+/// (stable). User-defined tokens rank as score 0 (the GGUF stores -1000 for
+/// them). Checked against google/gemma-3's tokenizer.json: identical.
+fn appendDerivedMerges(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tokens: gguf.Array, types: gguf.Array, scores: gguf.Array) !void {
+    if (scores.len != tokens.len) return error.BadMetadata;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const texts = try a.alloc([]const u8, tokens.len);
+    var vocab = std.StringHashMap(u32).init(a);
+    try vocab.ensureTotalCapacity(@intCast(tokens.len));
+    var it = tokens.strings();
+    var id: u32 = 0;
+    while (it.next()) |tok| : (id += 1) {
+        texts[id] = if (types.int(id) == TOKEN_USER_DEFINED) try std.mem.replaceOwned(u8, a, tok, " ", "\xe2\x96\x81") else tok;
+        try vocab.put(texts[id], id);
+    }
+    var merges: std.ArrayList(Merge) = .empty;
+    var local: std.ArrayList(Merge) = .empty;
+    for (texts, 0..) |t, i| {
+        const score: f32 = if (types.int(i) == TOKEN_USER_DEFINED) 0 else @floatCast(scores.float(i));
+        local.clearRetainingCapacity();
+        for (1..t.len) |k| {
+            if (t[k] & 0xC0 == 0x80) continue;
+            const l = vocab.get(t[0..k]) orelse continue;
+            const r = vocab.get(t[k..]) orelse continue;
+            try local.append(a, .{ .tok = @intCast(i), .split = @intCast(k), .l = l, .r = r, .score = score, .len_l = cpLen(t[0..k]), .len_r = cpLen(t[k..]) });
+        }
+        std.mem.sort(Merge, local.items, {}, struct {
+            fn lt(_: void, x: Merge, y: Merge) bool {
+                return if (x.l != y.l) x.l < y.l else x.r < y.r;
+            }
+        }.lt);
+        try merges.appendSlice(a, local.items);
+    }
+    // Block sort is stable, so ties keep the per-token order above.
+    std.mem.sort(Merge, merges.items, {}, struct {
+        fn lt(_: void, x: Merge, y: Merge) bool {
+            if (x.score != y.score) return x.score > y.score;
+            if (x.len_l != y.len_l) return x.len_l > y.len_l;
+            return x.len_r > y.len_r;
+        }
+    }.lt);
+    var pair: std.ArrayList(u8) = .empty;
+    for (merges.items, 0..) |m, j| {
+        if (j > 0) try out.append(allocator, ',');
+        pair.clearRetainingCapacity();
+        try pair.appendSlice(a, texts[m.tok][0..m.split]);
+        try pair.append(a, ' ');
+        try pair.appendSlice(a, texts[m.tok][m.split..]);
+        try appendJsonString(allocator, out, pair.items);
+    }
+}
+
+test "derived merges follow HF's order: score, then longer pieces, user-defined tokens as score 0" {
+    // vocab: a b ab abb bb "  " (user-defined, spaces) with scores
+    const w = TestArrays{ .tokens = &.{ "a", "b", "\xe2\x96\x81", "ab", "abb", "bb", "  " }, .types = &.{ 1, 1, 1, 1, 1, 1, TOKEN_USER_DEFINED }, .scores = &.{ -1, -1, -1, -3, -2, -3, -1000 } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try appendDerivedMerges(std.testing.allocator, &out, w.tokens_arr(), w.types_arr(), w.scores_arr());
+    // "  " -> "\u2581 \u2581" (score 0) first; abb (-2) splits: (a, bb) and (ab, b): longer left first; then ab and bb (-3) in token order.
+    try std.testing.expectEqualStrings("\"\xe2\x96\x81 \xe2\x96\x81\",\"ab b\",\"a bb\",\"a b\",\"b b\"", out.items);
+}
+
+/// GGUF arrays built in memory for the test above.
+const TestArrays = struct {
+    tokens: []const []const u8,
+    types: []const i64,
+    scores: []const f32,
+    buf_t: [256]u8 = undefined,
+    buf_y: [64]u8 = undefined,
+    buf_s: [64]u8 = undefined,
+
+    fn tokens_arr(self: *const TestArrays) gguf.Array {
+        const buf = @constCast(&self.buf_t);
+        var n: usize = 0;
+        for (self.tokens) |t| {
+            std.mem.writeInt(u64, buf[n..][0..8], t.len, .little);
+            @memcpy(buf[n + 8 ..][0..t.len], t);
+            n += 8 + t.len;
+        }
+        return .{ .elem_type = .string, .len = self.tokens.len, .bytes = buf[0..n] };
+    }
+    fn types_arr(self: *const TestArrays) gguf.Array {
+        const buf = @constCast(&self.buf_y);
+        for (self.types, 0..) |t, i| std.mem.writeInt(i32, buf[4 * i ..][0..4], @intCast(t), .little);
+        return .{ .elem_type = .i32, .len = self.types.len, .bytes = buf[0 .. 4 * self.types.len] };
+    }
+    fn scores_arr(self: *const TestArrays) gguf.Array {
+        const buf = @constCast(&self.buf_s);
+        for (self.scores, 0..) |v, i| std.mem.writeInt(u32, buf[4 * i ..][0..4], @bitCast(v), .little);
+        return .{ .elem_type = .f32, .len = self.scores.len, .bytes = buf[0 .. 4 * self.scores.len] };
+    }
+};
 
 fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(allocator, '"');
