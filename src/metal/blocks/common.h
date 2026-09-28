@@ -53,6 +53,10 @@ struct GgTile {
 };
 
 #define GG_U4(p) uint4(uchar4(*(const device packed_uchar4 *)(p)))
+// The 4 bytes of a word as lanes: a split row's payload comes in as aligned 16-byte loads.
+inline uint4 gg_bytes(uint w) {
+    return uint4(w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF, w >> 24);
+}
 #define GG_I4(p) int4(char4(*(const device packed_char4 *)(p)))
 
 inline float gg_half(const device uint8_t *b, uint off) {

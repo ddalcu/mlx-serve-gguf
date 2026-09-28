@@ -110,15 +110,15 @@ pub fn main(init: std.process.Init) !void {
     const a = std.heap.c_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const m: c_int = if (args.len > 2) try std.fmt.parseInt(c_int, args[2], 10) else 1;
-    iters = @max(4, ITERS_TOKENS / @as(usize, @intCast(m)));
+    iters = @max(16, ITERS_TOKENS / @as(usize, @intCast(m)));
     const s = mlx.mlx_default_gpu_stream_new();
     var prng = std.Random.DefaultPrng.init(1);
 
     // Per-op floor: a custom kernel over one block against MLX's own matmul on one row.
     {
-        var tiny_bytes: [18]u8 = undefined;
+        var tiny_bytes: [32]u8 = undefined;
         prng.random().bytes(&tiny_bytes);
-        const tiny = [_]mlx.mlx_array{mlx.mlx_array_new_data(&tiny_bytes, &[_]c_int{ 1, 18 }, 2, .uint8)};
+        const tiny = [_]mlx.mlx_array{mlx.mlx_array_new_data(&tiny_bytes, &[_]c_int{ 1, @intCast(kernels.rowBytes(.iq4_nl, 32)) }, 2, .uint8)};
         const xv1: [32]f32 = @splat(1);
         const x1 = mlx.mlx_array_new_data(&xv1, &[_]c_int{ 1, 32 }, 2, .float32);
         const custom_ms = try time(ggufMatvec, .{ .{ GgmlType.iq4_nl, x1 }, @as([]const mlx.mlx_array, &tiny), s }, s);
@@ -180,7 +180,7 @@ pub fn main(init: std.process.Init) !void {
                     if (std.mem.eql(u8, want, @tagName(ty))) break;
                 } else continue;
             }
-            const row_bytes = @as(usize, @intCast(sh.in)) / ty.blockElems() * ty.blockBytes();
+            const row_bytes = kernels.rowBytes(ty, @intCast(sh.in));
             const bytes = try a.alloc(u8, row_bytes * @as(usize, @intCast(sh.out)) * n_banks);
             defer a.free(bytes);
             const ws = try a.alloc(mlx.mlx_array, copiesFor(bytes.len));

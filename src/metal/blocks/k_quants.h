@@ -78,6 +78,28 @@ inline void deq_q4_k(const device uint8_t *b, uint j, thread O &o) { deq_q45_k(b
 template <typename O>
 inline void deq_q5_k(const device uint8_t *b, uint j, thread O &o) { deq_q45_k(b, j, o, true); }
 
+// Split rows: ql / qh as aligned 16-byte loads, scales + d in the head.
+template <typename O>
+inline void deq_q6_k_split(const device uint8_t *h, const device uint8_t *qs, uint n, thread O &o) {
+    const float d = gg_half(h, 16);
+    const device uchar4 *ql = (const device uchar4 *)(qs + 64 * n);
+    const device uchar4 *qh = (const device uchar4 *)(qs + 128 + 32 * n);
+    const device uint8_t *sc = h + 8 * n;
+    for (uint p = 0; p < 2; p++) {
+        for (uint g = 0; g < 2; g++) {
+            const float dlo = d * float(int8_t(sc[g + 2 * p]));
+            const float dhi = d * float(int8_t(sc[g + 2 * p + 4]));
+            for (uint k = 0; k < 4; k++) {
+                const uint c = 4 * g + k;
+                const uint4 q = uint4(ql[8 * p + c]);
+                const uint4 hb = uint4(qh[c]) >> (2 * p);
+                o.emit(8 * p + c, dlo * float4((q & 0xF) | ((hb & 3) << 4)) - 32.0f * dlo);
+                o.emit(8 * p + 16 + c, dhi * float4((q >> 4) | (((hb >> 4) & 3) << 4)) - 32.0f * dhi);
+            }
+        }
+    }
+}
+
 // Unit n, weight (k, l): low nibble from ql[64n + l + 32(k&1)] (high nibble for
 // k >= 2), top 2 bits from bits 2k of qh[32n + l], scale sc[8n + 2k + l/16].
 template <typename O>

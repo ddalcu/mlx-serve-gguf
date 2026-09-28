@@ -54,7 +54,8 @@ pub const Hparams = struct {
         if (sections.len < 3) return error.MissingMetadata;
         const n_experts = k.int("expert_count") catch 0;
         const hp = Hparams{
-            .n_layers = try k.int("block_count"),
+            // block_count includes the MTP head block(s) llama.cpp keeps after the trunk; mlx-serve does not use them.
+            .n_layers = (try k.int("block_count")) - (k.int("nextn_predict_layers") catch 0),
             .hidden = try k.int("embedding_length"),
             .ffn = if (n_experts == 0) try k.int("feed_forward_length") else 0,
             .n_experts = n_experts,
@@ -179,6 +180,8 @@ pub fn mapTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
     };
     for (globals) |g| if (std.mem.eql(u8, name, g[0])) return .{ .name = g[1], .transform = .none };
 
+    // The MTP head is the block right after the trunk.
+    if (arch.splitLayer(name, hp.n_layers + 1)) |b| if (b.layer == hp.n_layers) return arch.skip;
     const blk = arch.splitLayer(name, hp.n_layers) orelse return null;
 
     const v_rows = Transform{ .untile_rows = .{ .start = 0, .unit = hp.dv } };

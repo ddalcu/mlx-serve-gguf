@@ -10,6 +10,62 @@ pub const Error = error{ UnsupportedType, BadShape, MetalKernelCompileFailed, Me
 /// Up to this many activation rows go through the quantized matvec (decode,
 /// spec verify, decode batches): one kernel decodes each weight once for all of them.
 pub const MATVEC_MAX_ROWS = 8;
+
+/// A block is a scale head plus a 16, 32 or 192 byte payload, and the block
+/// sizes (17, 18, 20, 22, 24, 34, 210 bytes) put every payload at an
+/// unaligned address: byte loads. These types are stored SPLIT at load: a
+/// row holds all its payloads first, then all its heads (same bytes, same
+/// row length), so payloads sit at multiples of 16 and come in as aligned
+/// 16-byte loads. IQ4_NL 0.044 to 0.037 ms and Q4_0 to MLX parity on the
+/// 4B's ffn_up (measured). `payload_at`: the payload's offset in a GGUF block.
+pub const Split = struct { head: u32, payload: u32, payload_at: u32 };
+
+pub fn splitLayout(ty: GgmlType) ?Split {
+    return switch (ty) {
+        .q4_0, .iq4_nl => .{ .head = 2, .payload = 16, .payload_at = 2 },
+        .q4_1 => .{ .head = 4, .payload = 16, .payload_at = 4 },
+        .q5_0 => .{ .head = 6, .payload = 16, .payload_at = 6 },
+        .q5_1 => .{ .head = 8, .payload = 16, .payload_at = 8 },
+        .q8_0 => .{ .head = 2, .payload = 32, .payload_at = 2 },
+        .mxfp4 => .{ .head = 1, .payload = 16, .payload_at = 1 },
+        // ql (128) + qh (64) first, scales (16) + d (2) last.
+        .q6_k => .{ .head = 18, .payload = 192, .payload_at = 0 },
+        else => null,
+    };
+}
+
+/// Whether rows of `in` weights of this type are stored split.
+pub fn isSplit(ty: GgmlType, in: usize) bool {
+    return splitLayout(ty) != null and in % ty.blockElems() == 0;
+}
+
+/// Bytes per stored row of `in` weights: split rows are padded so every row
+/// starts 16-aligned (the padding is under a block, so the block count still
+/// follows from the row length).
+pub fn rowBytes(ty: GgmlType, in: usize) usize {
+    const raw = in / ty.blockElems() * ty.blockBytes();
+    return if (isSplit(ty, in)) (raw + 15) / 16 * 16 else raw;
+}
+
+/// Rows of `in` weights from the GGUF (interleaved) layout to the split one, `rowBytes` each.
+pub fn packRows(ty: GgmlType, in: usize, dst: []u8, src: []const u8) void {
+    const l = splitLayout(ty).?;
+    const nb = in / ty.blockElems();
+    const bb = ty.blockBytes();
+    const row = nb * bb;
+    const drow = rowBytes(ty, in);
+    const head_at: usize = if (l.payload_at == 0) l.payload else 0;
+    var r: usize = 0;
+    while (r < src.len / row) : (r += 1) {
+        const s = src[r * row ..][0..row];
+        const d = dst[r * drow ..][0..drow];
+        for (0..nb) |b| {
+            @memcpy(d[b * l.payload ..][0..l.payload], s[b * bb + l.payload_at ..][0..l.payload]);
+            @memcpy(d[nb * l.payload + b * l.head ..][0..l.head], s[b * bb + head_at ..][0..l.head]);
+        }
+        @memset(d[row..], 0);
+    }
+}
 /// Up to this many through the tile mat-mat kernel, which decodes weights as it
 /// goes. Past it, materializing the weight once and using MLX's GEMM is
 /// cheaper: in a live model the crossover sits between ~215 and ~515 prompt
@@ -107,7 +163,7 @@ const tile_macro = blk: {
         \\    for (uint u = 0; u < K / UNIT; u++) {
         \\        if (lid < TILE_ROWS) {
         \\            GgTile o = {tile + (lid / 8) * 8 * UNIT, lid % 8};
-        \\            DEQ(GG_W + (size_t(r0 + lid) * (K / BE) + u / UPB) * BB, u % UPB, o);
+        \\            DEQ_AT(GG_W, r0 + lid, u / UPB, u % UPB, o);
         \\        }
         \\        threadgroup_barrier(mem_flags::mem_threadgroup);
         \\        for (uint c = 0; c < UNIT; c += 8) {
@@ -157,7 +213,6 @@ fn tileRows(ty: GgmlType) c_int {
 const matvec_body =
     \\const uint lid = thread_index_in_simdgroup;
     \\const uint r0 = (threadgroup_position_in_grid.y * simdgroups_per_threadgroup + simdgroup_index_in_threadgroup) * RPT;
-    \\const uint nb = K / BE;
     \\const uint nu = K / UNIT;
     \\const uint z = threadgroup_position_in_grid.z;
     \\float acc[RPT][M] = {{0}};
@@ -166,7 +221,7 @@ const matvec_body =
     \\    const uint u = i % nu;
     \\    if (r0 + r >= N) break;
     \\    GgDot<T, M, K> o = {GG_X + u * UNIT, {0}};
-    \\    DEQ(GG_W + (size_t(r0 + r) * nb + u / UPB) * BB, u % UPB, o);
+    \\    DEQ_AT(GG_W, r0 + r, u / UPB, u % UPB, o);
     \\    for (uint m = 0; m < M; m++) acc[r][m] += o.acc[m].x + o.acc[m].y + o.acc[m].z + o.acc[m].w;
     \\}
     \\for (uint r = 0; r < RPT; r++) {
@@ -178,29 +233,42 @@ const matvec_body =
 ;
 
 fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
+    // DEQ_AT(w, row, blk, u, o): decode unit u of block blk of row `row` of
+    // weight w. SPLIT (template const, see isSplit) picks the row layout.
+    const layout = splitLayout(ty) orelse Split{ .head = 0, .payload = 0, .payload_at = 0 };
+    const deq_at = if (layout.head > 0)
+        std.fmt.comptimePrint(
+            \\#define DEQ_AT(w, row, blk, u, o) {{ if constexpr (SPLIT) deq_{s}_split((w) + size_t(row) * ROWB + NB * {d} + (blk) * {d}, (w) + size_t(row) * ROWB + (blk) * {d}, u, o); else deq_{s}((w) + (size_t(row) * NB + (blk)) * BB, u, o); }}
+            \\
+        , .{ @tagName(ty), layout.payload, layout.head, layout.payload, @tagName(ty) })
+    else
+        std.fmt.comptimePrint(
+            \\#define DEQ_AT(w, row, blk, u, o) deq_{s}((w) + (size_t(row) * NB + (blk)) * BB, u, o)
+            \\
+        , .{@tagName(ty)});
     const prelude = std.fmt.comptimePrint(
         \\const uint BE = {d};
         \\const uint BB = {d};
         \\const uint UNIT = {d};
         \\const uint UPB = BE / UNIT;
-        \\#define DEQ deq_{s}
+        \\const uint NB = K / BE;
         \\#define TILE_ROWS {d}
         \\#define TILE_TOKENS {d}
         \\
-    , .{ ty.blockElems(), ty.blockBytes(), ty.unitElems(), @tagName(ty), tileRows(ty), TILE_TOKENS });
+    , .{ ty.blockElems(), ty.blockBytes(), ty.unitElems(), tileRows(ty), TILE_TOKENS }) ++ deq_at;
     return prelude ++ switch (kind) {
         // One thread per unit.
         .dequant =>
         \\uint u = thread_position_in_grid.x;
         \\GgOut<T> o = {out + size_t(u) * UNIT};
-        \\DEQ(w + size_t(u / UPB) * BB, u % UPB, o);
+        \\DEQ_AT(w, u / (UPB * NB), (u / UPB) % NB, u % UPB, o);
         ,
         // Instance z takes activation rows [z * M, z * M + M).
         .matvec => "#define GG_W w\n#define GG_X (x + size_t(z) * M * K)\n" ++ matvec_body,
         // MoE: instance z is one (token, expert) pair, `ids[z]` its expert in
         // the bank w [experts, N, row bytes] and z / XDIV its activation row
         // (XDIV = experts per token, 1 when the rows come already repeated).
-        .gather => "#define GG_W (w + size_t(ids[z]) * N * nb * BB)\n#define GG_X (x + size_t(z / XDIV) * K)\n" ++ matvec_body,
+        .gather => "#define GG_W (w + size_t(ids[z]) * N * ROWB)\n#define GG_X (x + size_t(z / XDIV) * K)\n" ++ matvec_body,
         // x [M, K] f32 times w^T, M a multiple of 8 and N of TILE_ROWS. One
         // threadgroup (= one simdgroup, whose threads run simdgroup_matrix ops
         // TOGETHER) per output tile of TILE_TOKENS tokens x TILE_ROWS rows.
@@ -236,7 +304,7 @@ fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
             \\    uint lo = TILE_TOKENS, hi = 0;
             \\    for (uint p = m0; p < m_end; p++) if (ids[p] == e) { lo = min(lo, p - m0); hi = max(hi, p - m0); }
             \\    if (lo < m - m0) continue;
-            \\    const device uint8_t *we = w + size_t(e) * N * (K / BE) * BB;
+            \\    const device uint8_t *we = w + size_t(e) * N * ROWB;
             \\
         ++ tile_dispatch ++
             \\    threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -331,12 +399,25 @@ fn apply(
 }
 
 /// Weight geometry from its byte shape: rows and in_features.
-fn geometry(ty: GgmlType, w: mlx.mlx_array) Error!struct { rows: c_int, in: c_int } {
+fn geometry(ty: GgmlType, w: mlx.mlx_array) Error!struct { rows: c_int, in: c_int, row_bytes: c_int } {
     if (!ty.isQuantized()) return error.UnsupportedType;
     const ws = mlx.getShape(w);
+    if (ws.len != 2 or mlx.mlx_array_dtype(w) != .uint8) return error.BadShape;
+    const in = try inFeatures(ty, ws[1]);
+    return .{ .rows = ws[0], .in = in, .row_bytes = ws[1] };
+}
+
+/// Weights per row from the stored row length (see rowBytes).
+fn inFeatures(ty: GgmlType, row_bytes: c_int) Error!c_int {
     const bb: c_int = @intCast(ty.blockBytes());
-    if (ws.len != 2 or mlx.mlx_array_dtype(w) != .uint8 or @mod(ws[1], bb) != 0) return error.BadShape;
-    return .{ .rows = ws[0], .in = @divExact(ws[1], bb) * @as(c_int, @intCast(ty.blockElems())) };
+    const in = @divFloor(row_bytes, bb) * @as(c_int, @intCast(ty.blockElems()));
+    if (in == 0 or rowBytes(ty, @intCast(in)) != row_bytes) return error.BadShape;
+    return in;
+}
+
+/// The layout constants every kernel takes.
+fn layoutConsts(ty: GgmlType, in: c_int, row_bytes: c_int) [3]Const {
+    return .{ .{ "K", in }, .{ "ROWB", row_bytes }, .{ "SPLIT", @intFromBool(isSplit(ty, @intCast(in))) } };
 }
 
 /// y = x w[ids]^T over an expert bank w [experts, rows, row_bytes], the drop-in
@@ -350,11 +431,10 @@ fn geometry(ty: GgmlType, w: mlx.mlx_array) Error!struct { rows: c_int, in: c_in
 pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const ty = info.ty;
     const ws = mlx.getShape(w);
-    const bb: c_int = @intCast(ty.blockBytes());
     if (!ty.isQuantized() or info.tiled != null) return error.UnsupportedType;
-    if (ws.len != 3 or mlx.mlx_array_dtype(w) != .uint8 or @mod(ws[2], bb) != 0) return error.BadShape;
+    if (ws.len != 3 or mlx.mlx_array_dtype(w) != .uint8) return error.BadShape;
     const rows = ws[1];
-    const in = @divExact(ws[2], bb) * @as(c_int, @intCast(ty.blockElems()));
+    const in = try inFeatures(ty, ws[2]);
 
     const xs = mlx.getShape(x);
     if (xs.len < 2 or xs[xs.len - 1] != in or xs[xs.len - 2] != 1) return error.BadShape;
@@ -443,14 +523,14 @@ pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx
 
     const rpt = matvecRows(1);
     const groups = @divFloor(rows + rpt * SIMDGROUPS - 1, rpt * SIMDGROUPS);
-    return apply(try kernel(.gather, ty), &.{ x_in, w, ids }, out_shape[0 .. os.len + 2], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, n_out }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &.{ .{ "K", in }, .{ "N", rows }, .{ "M", 1 }, .{ "RPT", rpt }, .{ "XDIV", xdiv } }, s);
+    return apply(try kernel(.gather, ty), &.{ x_in, w, ids }, out_shape[0 .. os.len + 2], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, n_out }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, in, ws[2]) ++ [_]Const{ .{ "N", rows }, .{ "M", 1 }, .{ "RPT", rpt }, .{ "XDIV", xdiv } }), s);
 }
 
 /// w [rows, row_bytes] -> [rows, in_features] in `dtype`.
 pub fn dequantize(ty: GgmlType, w: mlx.mlx_array, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     const g = try geometry(ty, w);
     const n_units = g.rows * @divExact(g.in, @as(c_int, @intCast(ty.unitElems())));
-    return apply(try kernel(.dequant, ty), &.{w}, &.{ g.rows, g.in }, dtype, .{ n_units, 1, 1 }, .{ @min(n_units, 64), 1, 1 }, &.{}, s);
+    return apply(try kernel(.dequant, ty), &.{w}, &.{ g.rows, g.in }, dtype, .{ n_units, 1, 1 }, .{ @min(n_units, 64), 1, 1 }, &layoutConsts(ty, g.in, g.row_bytes), s);
 }
 
 /// x [..., in_features] times w^T -> [..., rows], straight off the blocks.
@@ -469,7 +549,7 @@ pub fn matvec(ty: GgmlType, x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_strea
     var rpt = matvecRows(per);
     while (rpt > 1 and @divFloor(g.rows, rpt) < MIN_SIMDGROUPS) rpt = @divExact(rpt, 2);
     const groups = @divFloor(g.rows + rpt * SIMDGROUPS - 1, rpt * SIMDGROUPS);
-    return apply(try kernel(.matvec, ty), &.{ x, w }, out_shape[0..xs.len], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, @divExact(m, per) }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &.{ .{ "K", g.in }, .{ "N", g.rows }, .{ "M", per }, .{ "RPT", rpt } }, s);
+    return apply(try kernel(.matvec, ty), &.{ x, w }, out_shape[0..xs.len], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, @divExact(m, per) }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, g.in, g.row_bytes) ++ [_]Const{ .{ "N", g.rows }, .{ "M", per }, .{ "RPT", rpt } }), s);
 }
 
 /// x [M, in_features] times w^T -> [M, rows], rows a multiple of tileRows.
@@ -488,6 +568,8 @@ pub fn matmat(ty: GgmlType, x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_strea
 /// x [M, K] through a tile kernel whose inputs after x are `rest`, rows a
 /// multiple of tileRows. The glue around the kernel, see `matmat`.
 fn tileGlue(comptime kind: Kind, ty: GgmlType, x: mlx.mlx_array, rest: []const mlx.mlx_array, rows: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const wshape = mlx.getShape(rest[0]);
+    const row_bytes = wshape[wshape.len - 1];
     const xs = mlx.getShape(x);
     const m = xs[0];
     const k = xs[1];
@@ -502,7 +584,7 @@ fn tileGlue(comptime kind: Kind, ty: GgmlType, x: mlx.mlx_array, rest: []const m
     var inputs: [3]mlx.mlx_array = undefined;
     inputs[0] = x32;
     @memcpy(inputs[1 .. 1 + rest.len], rest);
-    const y32 = try apply(try kernel(kind, ty), inputs[0 .. 1 + rest.len], &.{ m_pad, rows }, .float32, .{ SIMD_WIDTH * @divExact(rows, tileRows(ty)), @divFloor(m_pad + TILE_TOKENS - 1, TILE_TOKENS), 1 }, .{ SIMD_WIDTH, 1, 1 }, &.{ .{ "K", k }, .{ "N", rows } }, s);
+    const y32 = try apply(try kernel(kind, ty), inputs[0 .. 1 + rest.len], &.{ m_pad, rows }, .float32, .{ SIMD_WIDTH * @divExact(rows, tileRows(ty)), @divFloor(m_pad + TILE_TOKENS - 1, TILE_TOKENS), 1 }, .{ SIMD_WIDTH, 1, 1 }, &(layoutConsts(ty, k, row_bytes) ++ [_]Const{.{ "N", rows }}), s);
     if (!glue) return y32;
     defer _ = mlx.mlx_array_free(y32);
     const n_out = m * rows;
@@ -646,8 +728,12 @@ const TestWeight = struct {
         const ref = try std.testing.allocator.alloc(f32, 4 * ty.blockElems());
         errdefer std.testing.allocator.free(ref);
         try quants.dequantize(ty, bytes, ref);
-        const shape = [_]c_int{ 2, @intCast(2 * ty.blockBytes()) };
-        return .{ .ty = ty, .arr = mlx.mlx_array_new_data(bytes.ptr, &shape, 2, .uint8), .ref = ref, .in = 2 * ty.blockElems() };
+        // Rows go in the layout the kernels expect.
+        const in = 2 * ty.blockElems();
+        const shape = [_]c_int{ 2, @intCast(rowBytes(ty, in)) };
+        var rows: [4 * 256]u8 = undefined;
+        if (isSplit(ty, in)) packRows(ty, in, rows[0 .. 2 * rowBytes(ty, in)], bytes) else @memcpy(rows[0..bytes.len], bytes);
+        return .{ .ty = ty, .arr = mlx.mlx_array_new_data(&rows, &shape, 2, .uint8), .ref = ref, .in = in };
     }
 
     fn deinit(self: TestWeight) void {
@@ -724,7 +810,9 @@ test "tile mat-mat kernel (32 rows, whole and padded token tiles) equals a CPU d
         for (0..n_rows / 4) |i| @memcpy(bytes[4 * i * bb ..][0 .. 4 * bb], data[0 .. 4 * bb]);
         var ref: [4 * 256]f32 = undefined;
         try quants.dequantize(ty, data[0 .. 4 * bb], ref[0 .. 4 * be]);
-        const w = mlx.mlx_array_new_data(&bytes, &[_]c_int{ n_rows, @intCast(bb) }, 2, .uint8);
+        var rows: [n_rows * 256]u8 = undefined;
+        if (isSplit(ty, be)) packRows(ty, be, rows[0 .. n_rows * rowBytes(ty, be)], bytes[0 .. n_rows * bb]) else @memcpy(rows[0 .. n_rows * bb], bytes[0 .. n_rows * bb]);
+        const w = mlx.mlx_array_new_data(&rows, &[_]c_int{ n_rows, @intCast(rowBytes(ty, be)) }, 2, .uint8);
         defer _ = mlx.mlx_array_free(w);
 
         for ([_]usize{ 32, 41, 9 }) |m| {
@@ -762,9 +850,11 @@ test "gatherLinear routes every output to its expert, with and without lhs indic
         const tw = try TestWeight.init(ty);
         defer tw.deinit();
         const in = ty.blockElems();
-        var bank = mlx.mlx_array_new();
+        const data = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin");
+        var rows: [4 * 256]u8 = undefined;
+        if (isSplit(ty, in)) packRows(ty, in, rows[0 .. 4 * rowBytes(ty, in)], data[0 .. 4 * ty.blockBytes()]) else @memcpy(rows[0 .. 4 * ty.blockBytes()], data[0 .. 4 * ty.blockBytes()]);
+        const bank = mlx.mlx_array_new_data(&rows, &[_]c_int{ 2, 2, @intCast(rowBytes(ty, in)) }, 3, .uint8);
         defer _ = mlx.mlx_array_free(bank);
-        try mlx.check(mlx.mlx_reshape(&bank, tw.arr, &[_]c_int{ 2, 2, @intCast(ty.blockBytes()) }, 3, s));
 
         const xv = try std.testing.allocator.alloc(f32, 3 * in);
         defer std.testing.allocator.free(xv);
@@ -819,7 +909,9 @@ test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals 
         for (0..n_exp) |e| for (0..n_rows) |r| @memcpy(bytes[(e * n_rows + r) * bb ..][0..bb], data[((r + e) % 4) * bb ..][0..bb]);
         var ref: [4 * 256]f32 = undefined;
         try quants.dequantize(ty, data[0 .. 4 * bb], ref[0 .. 4 * be]);
-        const bank = mlx.mlx_array_new_data(&bytes, &[_]c_int{ n_exp, n_rows, @intCast(bb) }, 3, .uint8);
+        var rows: [n_exp * n_rows * 256]u8 = undefined;
+        if (isSplit(ty, be)) packRows(ty, be, rows[0 .. n_exp * n_rows * rowBytes(ty, be)], bytes[0 .. n_exp * n_rows * bb]) else @memcpy(rows[0 .. n_exp * n_rows * bb], bytes[0 .. n_exp * n_rows * bb]);
+        const bank = mlx.mlx_array_new_data(&rows, &[_]c_int{ n_exp, n_rows, @intCast(rowBytes(ty, be)) }, 3, .uint8);
         defer _ = mlx.mlx_array_free(bank);
 
         // 41 rows: the tile path (one whole tile plus a padded one); 80: the
@@ -856,6 +948,58 @@ test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals 
             }
         }
     }
+}
+
+test "split rows (16 blocks per row, packed at load) match the CPU reference for every split type" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var prng = std.Random.DefaultPrng.init(31);
+    inline for (all_types) |ty| if (comptime splitLayout(ty) != null) {
+        // 4 rows x 16 blocks (the 4 fixture blocks over and over, shifted per row): 512 weights per row make every head region a multiple of 16 bytes.
+        const be = ty.blockElems();
+        const bb = ty.blockBytes();
+        const data = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin");
+        const n_rows = 4;
+        const nb = 16;
+        const in = nb * be;
+        try std.testing.expect(isSplit(ty, in));
+        var src: [n_rows * nb * 256]u8 = undefined;
+        for (0..n_rows * nb) |i| @memcpy(src[i * bb ..][0..bb], data[((i + i / nb) % 4) * bb ..][0..bb]);
+        var pk: [n_rows * (nb * 256 + 16)]u8 = undefined;
+        packRows(ty, in, pk[0 .. n_rows * rowBytes(ty, in)], src[0 .. n_rows * nb * bb]);
+        var ref: [4 * 256]f32 = undefined;
+        try quants.dequantize(ty, data[0 .. 4 * bb], ref[0 .. 4 * be]);
+        const w = mlx.mlx_array_new_data(&pk, &[_]c_int{ n_rows, @intCast(rowBytes(ty, in)) }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(w);
+        const xv = try std.testing.allocator.alloc(f32, in);
+        defer std.testing.allocator.free(xv);
+        for (xv) |*v| v.* = prng.random().float(f32) - 0.5;
+        const x = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ 1, @intCast(in) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(x);
+        const y = try linear(.{ .ty = ty }, x, w, s);
+        defer _ = mlx.mlx_array_free(y);
+        const got = try readF32(y, n_rows);
+        for (0..n_rows) |r| {
+            var want: f32 = 0;
+            var scale: f32 = 0;
+            for (0..nb) |blk| for (0..be) |j| {
+                const term = xv[blk * be + j] * ref[((r * nb + blk + r) % 4) * be + j];
+                want += term;
+                scale += @abs(term);
+            };
+            if (@abs(want - got[r]) > 1e-5 * scale) {
+                std.debug.print("{s} split row {d}: got {d} want {d}\n", .{ @tagName(ty), r, got[r], want });
+                return error.TestUnexpectedResult;
+            }
+        }
+        // The whole-weight decode reads the split rows too.
+        const wd = try dequantize(ty, w, .float32, s);
+        defer _ = mlx.mlx_array_free(wd);
+        const dq = try readF32(wd, n_rows * in);
+        for (0..n_rows) |r| for (0..nb) |blk| for (0..be) |j| {
+            try std.testing.expectApproxEqRel(ref[((r * nb + blk + r) % 4) * be + j], dq[r * in + blk * be + j], 1e-5);
+        };
+    };
 }
 
 test "half precision activations keep their dtype and stay close to f32" {
@@ -897,7 +1041,7 @@ test "shape and type mistakes are errors, not GPU faults" {
     defer _ = mlx.mlx_stream_free(s);
     const w = try TestWeight.init(.iq4_nl);
     defer w.deinit();
-    try std.testing.expectError(error.BadShape, dequantize(.q8_0, w.arr, .float32, s));
+    try std.testing.expectError(error.BadShape, dequantize(.q4_k, w.arr, .float32, s));
     try std.testing.expectError(error.UnsupportedType, dequantize(.f16, w.arr, .float32, s));
     const x = mlx.mlx_array_new_data(&[_]f32{ 1, 2, 3 }, &[_]c_int{ 1, 3 }, 2, .float32);
     defer _ = mlx.mlx_array_free(x);

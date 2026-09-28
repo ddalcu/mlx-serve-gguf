@@ -83,7 +83,7 @@ fn loadQuantized(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.
         if (mapped.transform != .none) return error.UnsupportedTensor;
         const experts: usize = @intCast(t.dims[2]);
         const bank = [_]c_int{ @intCast(experts), @intCast(rows), @intCast(t.data.len / experts / rows) };
-        try put(allocator, out, mapped.name, mlx.mlx_array_new_data(t.data.ptr, &bank, 3, .uint8));
+        try put(allocator, out, mapped.name, try packedRows(allocator, t.ty, t.data, &bank, s));
         return putSentinel(allocator, out, mapped.name, .{ .ty = t.ty }, s);
     }
     if (t.n_dims != 2) return error.UnsupportedTensor;
@@ -113,7 +113,7 @@ fn loadQuantized(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.
 
     var info = kernels.Info{ .ty = t.ty };
     const w = switch (mapped.transform) {
-        .none => mlx.mlx_array_new_data(t.data.ptr, &shape, 2, .uint8),
+        .none => try packedRows(allocator, t.ty, t.data, &shape, s),
         .tiled_input => blk: {
             info.tiled = .{ .nk = @intCast(hp.nk), .r = @intCast(hp.r()) };
             break :blk mlx.mlx_array_new_data(t.data.ptr, &shape, 2, .uint8);
@@ -124,12 +124,28 @@ fn loadQuantized(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.
             const tmp = try allocator.alloc(u8, t.data.len);
             defer allocator.free(tmp);
             untile(tmp, t.data, u.start * row_bytes, u.unit * row_bytes, hp);
-            break :blk mlx.mlx_array_new_data(tmp.ptr, &shape, 2, .uint8);
+            break :blk try packedRows(allocator, t.ty, tmp, &shape, s);
         },
         else => return error.UnsupportedTensor,
     };
     try put(allocator, out, mapped.name, w);
     try putSentinel(allocator, out, mapped.name, info, s);
+}
+
+/// The weight as an MLX array, rows in the split layout when the kernels want it (see kernels.isSplit).
+fn packedRows(allocator: std.mem.Allocator, ty: @import("quants.zig").GgmlType, bytes: []const u8, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    _ = s;
+    const row_bytes: usize = @intCast(shape[shape.len - 1]);
+    const in = row_bytes / ty.blockBytes() * ty.blockElems();
+    if (!kernels.isSplit(ty, in)) return mlx.mlx_array_new_data(bytes.ptr, shape.ptr, @intCast(shape.len), .uint8);
+    const rows = bytes.len / row_bytes;
+    const tmp = try allocator.alloc(u8, rows * kernels.rowBytes(ty, in));
+    defer allocator.free(tmp);
+    kernels.packRows(ty, in, tmp, bytes);
+    var padded: [3]c_int = undefined;
+    @memcpy(padded[0..shape.len], shape);
+    padded[shape.len - 1] = @intCast(kernels.rowBytes(ty, in));
+    return mlx.mlx_array_new_data(tmp.ptr, &padded, @intCast(shape.len), .uint8);
 }
 
 /// `<base>.scales` next to `<base>.weight`, see kernels.Info.

@@ -149,7 +149,7 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
 
     engines = {
-        "mlx": [args.bin, "--model", args.model, "--serve", "--port", "{port}", "--mlx-gguf", "--no-pld"],
+        "mlx": [args.bin, "--model", args.model, "--serve", "--port", "{port}", "--mlx-gguf", "--no-pld", "--no-drafter", "--no-mtp"],
         "llama": [args.bin, "--model", args.model, "--serve", "--port", "{port}", "--engine", "llama"],
     }
     if args.llama_server:

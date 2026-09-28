@@ -16,6 +16,7 @@ Works end to end in mlx-serve, text only, greedy output at parity with llama.cpp
 
 - Qwen3.5 / Qwen3.6 dense (GGUF arch `qwen35`)
 - Qwen3.5 / Qwen3.6 MoE (`qwen35moe`, the 35B-A3B)
+- Qwen3.8 dense (also `qwen35`; the MTP head block llama.cpp keeps after the trunk is skipped)
 - Gemma 4 (`gemma4`): E2B & E4B (per-layer embeddings, shared KV layers) and the dense 12B (K = V on the full attention layers)
 - Gemma 3 (`gemma3`): 1B / 4B / 12B / 27B text. The SentencePiece vocab has no merges in the GGUF, they are derived from the scores the way HF's converter does it (identical to google's tokenizer.json, checked).
 - LFM2 (`lfm2`) and LFM2-MoE (`lfm2moe`)
@@ -56,27 +57,34 @@ M4 Max 128 GB, `scripts/parity.py`, 64 tokens greedy, decode tok/s and time to f
 
 | file | this, tok/s | llama.cpp, tok/s | this, prefill | llama.cpp, prefill | parity |
 |---|---|---|---|---|---|
-| Qwen3.5-0.8B IQ4_NL | 340 | 275 | 207 ms | 228 ms | ok |
+| Qwen3.5-0.8B IQ4_NL | 445 | 275 | 206 ms | 231 ms | ok |
 | Qwen3.5-0.8B Q4_0 | 456 | 279 | 205 ms | 226 ms | ok |
 | Qwen3.5-0.8B IQ1_M | 373 | 258 | 206 ms | 260 ms | ok |
-| Qwen3.5-4B IQ4_NL | 113 | 104 | 1102 ms | 1178 ms | ok |
-| Gemma 4 E2B IQ4_NL | 171 | 152 | 600 ms | 654 ms | ok |
-| Gemma 3 1B Q4_0 | 301 | 278 | 278 ms | 243 ms | ok |
+| Qwen3.5-4B IQ4_NL | 121 | 104 | 1070 ms | 1174 ms | ok |
+| Qwen3.5-4B Q4_K_M | 111 | 99 | 1146 ms | 1229 ms | ok |
+| Gemma 4 E2B IQ4_NL | 182 | 152 | 573 ms | 652 ms | ok |
+| Gemma 4 E4B IQ4_NL | 105 | 95 | 1137 ms | 1244 ms | ok |
+| Gemma 3 1B Q4_0 | 386 | 275 | 220 ms | 244 ms | ok |
 | Gemma 3 4B IQ4_NL | 128 | 132 | 896 ms | 966 ms | ok |
-| LFM2-1.2B Q4_0 | 382 | 400 | 307 ms | 310 ms | ok |
+| LFM2-1.2B Q4_0 | 490 | 400 | 305 ms | 309 ms | ok |
 | LFM2-8B-A1B Q4_0 (MoE) | 255 | 258 | | | ok |
 | Qwen3.6-35B-A3B UD-IQ1_M (MoE) | 101 | 87 | 1214 ms | 1357 ms | ok |
+| Qwen3.8-27B Q4_0 (dense) | 25.7 | 24.1 | 6605 ms | 7142 ms | ok |
 | gpt-oss-20b Q4_K_M (MXFP4 experts) | 102 | 100 | 1303 ms | 1390 ms | ok, raw prompts |
 | Nemotron-3-Nano-30B-A3B IQ4_NL (Mamba2 + MoE) | 115 | 100 | 4299 ms | 1443 ms | ok |
 | Qwen3-Next-80B-A3B UD-IQ2_XXS (GDN + MoE) | 91 | 66 | 2018 ms | 1738 ms | ok |
 
 Parity "ok" = every prompt matches byte for byte or forks on a tie under 0.2 nats. The Nemotron prefill time was taken before the materialized-bank path below (the other MoE rows are after it). On a base M4 16 GB (the earlier numbers) the same kernels were bandwidth bound and ahead everywhere; the M4 Max has 4x the bandwidth and turned the small matrices latency bound, which is what the last two items below are about.
 
-Quality on the same low-bit files, llmprobe (`scripts/llmprobe_ab.sh`, greedy, thinking off, 2048 token cap): reasoning accuracy this engine / llama.cpp: gpt-oss-20b Q4_K_M 61% / 45% (llama.cpp ran out of tokens on 43 questions, this engine on 13), Qwen3-Next IQ2_XXS 47% / 48%, Gemma 3 1B Q4_0 10% / 9%, Qwen3.5-0.8B IQ1_M 1% / 0%. Capability cards identical on every file.
+The same models as native 4-bit MLX checkpoints on mlx-serve, decode tok/s (native / this engine on the IQ4_NL GGUF / llama.cpp): Qwen3.5-0.8B 560 / 445 / 275, Gemma 4 E2B 219 / 182 / 152, Qwen3.5-4B 159 / 121 / 104, Gemma 4 E4B 128 / 105 / 95, Qwen3.8-27B (Q4_0 GGUF) 30.0 / 25.7 / 24.1 with the native run's DFlash drafter and MTP off (with them on it does 70 to 135). Prefill is at native speed on the GGUF path (4B: 1083 / 1072 / 1167 ms). The decode gap to native is the next target, see `more-speed.md`.
+
+Quality on the same low-bit files, llmprobe (`scripts/llmprobe_ab.sh`, greedy, thinking off, 2048 token cap): reasoning accuracy this engine / llama.cpp: gpt-oss-20b Q4_K_M 61% / 45% (llama.cpp ran out of tokens on 43 questions, this engine on 13), Qwen3-Next IQ2_XXS 47% / 48%, Gemma 3 1B Q4_0 10% / 9%, Qwen3.5-0.8B IQ1_M 1% / 0%. Capability cards identical on every file. GPQA Diamond alone (24 questions, same cap, native MLX 4-bit checkpoint / this engine on the IQ4_NL GGUF / llama.cpp on it): Qwen3.5-4B 24% / 36% / 40%, Gemma 4 E2B 28% / 36% / 16%, Gemma 4 E4B 12% / 32% / 24%. At 24 questions with a 2048 token cap these mostly measure which runs hit the cap; the direction is the point, not the digits.
 
 What made the difference, in case you touch the kernels:
 
 - MLX hashes a custom kernel's whole source string on EVERY dispatch (`std::hash` in `CustomKernel::eval_gpu`). With all the IQ codebooks and decoders in one header that was 90 KB and ~6 us per matvec, a quarter of a token on the E2B. Every kernel now carries only the decoder and tables of its own type (`headerFor`): 8.7 to 4.4 us per op, E2B decode 133 to 171 tok/s, the 0.8B 250 to 456.
+- The rest of that per-op cost is MLX rebuilding and hashing the generated kernel source on every call. `patches/mlx-custom-kernel-source-cache.patch` (against mlx v0.32.2) caches both per kernel name: 4.2 to 3.4 us per op, a native MLX op is 2.8. Apply it to mlx-serve's `lib/mlx-src` before `scripts/build-mlx.sh` (`git -C lib/mlx-src apply ../mlx-serve-gguf/patches/mlx-custom-kernel-source-cache.patch`).
+- The 32-weight block types (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, MXFP4) and Q6_K have block sizes (17 to 34, 210 bytes) that put every payload at an unaligned address, so the decoders were doing byte loads. Rows of those types are stored SPLIT at load (`kernels.splitLayout`, `packRows`): all payloads first, then all scale heads, rows padded to 16 bytes. Same bytes, the decoders read aligned 16-byte loads. IQ4_NL went from 1.40x to 1.22x of MLX's qmv, Q4_0 to parity, MXFP4 to 1.17x; Q6_K (1.50x) and Q8_0 (1.83x) now sit at their byte-count floors. Tried and measured slower: a register lookup for the IQ4_NL codebook (selects and shifts, 2x slower than the `constant int8_t` gather), a float table, a threadgroup-memory table.
 - Small weights (`attn_kv`, 1536 -> 256) are latency bound: fewer rows per simdgroup puts more of them in flight (`MIN_SIMDGROUPS`).
 - The 32 threads of a simdgroup run in LOCKSTEP. A loop costs every thread the longest trip count of any of them. Striping each weight row over the 32 threads on its own wastes lanes whenever 32 doesn't divide the units of a row (K = 1536 IQ4_NL is 48 units = 75%, Q6_K at K = 2560 is 20 units = 62%). Rotating the stripes per row does nothing (measured). The fix: a simdgroup stripes its 8 rows x units as ONE run. That alone took the Q6_K 248k row lm_head from 6.6 to 5.0 ms and the 4B from 31 to 33 tok/s on the base M4.
 - On the base M4 every type sits at its bits per weight vs MLX's own 4-bit kernel (Q4_K 1.0x, IQ4_NL 1.03 to 1.1x, Q5_K 1.27x, Q6_K 1.45x). On the M4 Max the big shapes are at 1.1x (Q4_K) to 1.55x (Q6_K) and the small ones at 1.2 to 1.8x: `zig build bench` prints the table, and `per-op floor` on its first line is the fixed cost of one dispatch against a native MLX op.

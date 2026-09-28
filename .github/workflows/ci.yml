@@ -77,11 +77,16 @@ jobs:
       - name: Install dependencies
         run: brew bundle install --file=mlx-serve/Brewfile
 
+      # The custom-kernel source cache (patches/, see README): applied to the
+      # pinned mlx before it is built, and part of the stage's cache key.
+      - name: Patch mlx
+        run: git -C mlx-serve/lib/mlx-src apply "$GITHUB_WORKSPACE/mlx-serve-gguf/patches/mlx-custom-kernel-source-cache.patch"
+
       - name: Compute mlx pin cache key
         id: mlxpin
         working-directory: mlx-serve
         run: |
-          echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)-$(shasum ../mlx-serve-gguf/patches/*.patch | shasum | cut -c1-8)" >> "$GITHUB_OUTPUT"
           echo "mlxc=$(git -C lib/mlxc-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
       - name: Cache self-built mlx + mlx-c

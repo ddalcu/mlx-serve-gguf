@@ -1,0 +1,171 @@
+diff --git a/mlx/backend/common/metal_kernel.cpp b/mlx/backend/common/metal_kernel.cpp
+index 7a2eef51f..29a331e42 100644
+--- a/mlx/backend/common/metal_kernel.cpp
++++ b/mlx/backend/common/metal_kernel.cpp
+@@ -1,6 +1,8 @@
+ // Copyright © 2024 Apple Inc.
+ 
+ #include <iostream>
++#include <mutex>
++#include <unordered_map>
+ #include <sstream>
+ 
+ #include "mlx/backend/common/compiled.h"
+@@ -270,6 +272,16 @@ CustomKernelFunction metal_kernel(
+     }
+   }
+ 
++  // The generated source is a pure function of the kernel name (template args,
++  // dtypes, how inputs are passed), so build and hash it once per name: a
++  // decode step dispatches the same few kernels hundreds of times.
++  struct SourceEntry {
++    std::string source;
++    size_t hash;
++  };
++  auto source_cache =
++      std::make_shared<std::unordered_map<std::string, SourceEntry>>();
++  auto source_cache_mutex = std::make_shared<std::mutex>();
+   return [=,
+           shape_infos = std::move(shape_infos),
+           attributes = std::move(attributes)](
+@@ -324,35 +336,49 @@ CustomKernelFunction metal_kernel(
+       kernel_name += get_type_string(dtype);
+     }
+ 
+-    std::string kernel_source = write_signature(
+-        kernel_name,
+-        header,
+-        source,
+-        input_names,
+-        inputs,
+-        output_names,
+-        output_dtypes,
+-        template_args,
+-        attributes,
+-        shape_infos,
+-        atomic_outputs);
+-
+-    if (!template_args.empty()) {
+-      template_def = kernel_name + template_def;
+-      kernel_source += "\ntemplate [[host_name(\"";
+-      kernel_source += kernel_name;
+-      kernel_source += "\")]] [[kernel]] decltype(";
+-      kernel_source += template_def;
+-      kernel_source += ") ";
+-      kernel_source += template_def;
+-      kernel_source += ";\n";
++    SourceEntry entry;
++    {
++      std::lock_guard<std::mutex> lock(*source_cache_mutex);
++      auto it = source_cache->find(kernel_name);
++      if (it != source_cache->end()) {
++        entry = it->second;
++      }
+     }
++    if (entry.source.empty()) {
++      std::string kernel_source = write_signature(
++          kernel_name,
++          header,
++          source,
++          input_names,
++          inputs,
++          output_names,
++          output_dtypes,
++          template_args,
++          attributes,
++          shape_infos,
++          atomic_outputs);
+ 
+-    if (verbose) {
+-      std::cout << "Generated source code for `" << name << "`:" << std::endl
+-                << "```" << std::endl
+-                << kernel_source << std::endl
+-                << "```" << std::endl;
++      if (!template_args.empty()) {
++        template_def = kernel_name + template_def;
++        kernel_source += "\ntemplate [[host_name(\"";
++        kernel_source += kernel_name;
++        kernel_source += "\")]] [[kernel]] decltype(";
++        kernel_source += template_def;
++        kernel_source += ") ";
++        kernel_source += template_def;
++        kernel_source += ";\n";
++      }
++
++      if (verbose) {
++        std::cout << "Generated source code for `" << name << "`:" << std::endl
++                  << "```" << std::endl
++                  << kernel_source << std::endl
++                  << "```" << std::endl;
++      }
++      entry.hash = std::hash<std::string>{}(kernel_source);
++      entry.source = std::move(kernel_source);
++      std::lock_guard<std::mutex> lock(*source_cache_mutex);
++      source_cache->emplace(kernel_name, entry);
+     }
+ 
+     return array::make_arrays(
+@@ -361,7 +387,7 @@ CustomKernelFunction metal_kernel(
+         std::make_shared<CustomKernel>(
+             s,
+             std::move(kernel_name),
+-            std::move(kernel_source),
++            entry.source,
+             grid,
+             threadgroup,
+             shape_infos,
+@@ -370,7 +396,8 @@ CustomKernelFunction metal_kernel(
+             std::vector<ScalarArg>{},
+             false,
+             0,
+-            compile_options.serialize()),
++            compile_options.serialize(),
++            entry.hash),
+         std::move(inputs));
+   };
+ }
+diff --git a/mlx/backend/metal/custom_kernel.cpp b/mlx/backend/metal/custom_kernel.cpp
+index b73dd72de..e7fe9fe1c 100644
+--- a/mlx/backend/metal/custom_kernel.cpp
++++ b/mlx/backend/metal/custom_kernel.cpp
+@@ -47,8 +47,10 @@ void CustomKernel::eval_gpu(
+ 
+   auto& d = metal::device(s.device);
+ 
+-  std::string lib_name = fmt::format(
+-      "{}_{:x}_{}", name_, std::hash<std::string>{}(source_), compile_options_);
++  size_t source_hash =
++      source_hash_ ? source_hash_ : std::hash<std::string>{}(source_);
++  std::string lib_name =
++      fmt::format("{}_{:x}_{}", name_, source_hash, compile_options_);
+   auto lib = d.get_library(
+       lib_name, compile_options_, [this] { return metal::utils() + source_; });
+   auto kernel = d.get_kernel(name_, lib);
+diff --git a/mlx/fast_primitives.h b/mlx/fast_primitives.h
+index 63021cd0c..b9097896e 100644
+--- a/mlx/fast_primitives.h
++++ b/mlx/fast_primitives.h
+@@ -447,10 +447,12 @@ class CustomKernel : public Primitive {
+       std::vector<ScalarArg> scalar_arguments,
+       bool is_precompiled,
+       int shared_memory,
+-      CompileOptions::Data compile_options = {})
++      CompileOptions::Data compile_options = {},
++      size_t source_hash = 0)
+       : Primitive(stream),
+         name_(std::move(name)),
+         source_(std::move(source)),
++        source_hash_(source_hash),
+         grid_(grid),
+         threadgroup_(threadgroup),
+         shape_infos_(std::move(shape_infos)),
+@@ -488,6 +490,9 @@ class CustomKernel : public Primitive {
+  private:
+   std::string name_;
+   std::string source_;
++  // Hash of source_ when the caller already has it (metal_kernel caches the
++  // generated source per kernel name), 0 = compute at eval.
++  size_t source_hash_;
+   std::tuple<int, int, int> grid_;
+   std::tuple<int, int, int> threadgroup_;
+   std::vector<std::tuple<bool, bool, bool>> shape_infos_;
