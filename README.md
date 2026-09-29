@@ -2,11 +2,19 @@
 
 This is not the main repo for MLX-Serve, its an experiment.
 
-GGUF engine for [mlx-serve](https://mlxserve.com). Serves GGUF files as is (no conversion) on MLX with custom Metal kernels, so mlx-serve can drop llama.cpp dependency and focus on speed.
+GGUF engine for [mlx-serve](https://mlxserve.com): runs GGUF files directly on Apple GPUs, no conversion, so mlx-serve can drop its llama.cpp dependency.
 
-It's a separate repo on purpose, it will grow as models get added, and mlx-serve only needs a thin bridge to it.
+How it works:
 
-Also its a separate repo because I want to encourage the community to open many PR's here. 
+- The GGUF is read as is. The config, tokenizer and chat template mlx-serve needs are rebuilt in memory from the file's metadata.
+- The quantized weights go to the GPU in the exact ggml block layout llama.cpp stored them in. Nothing is requantized or converted to MLX's own format.
+- mlx-serve runs the model like any MLX checkpoint. Every matmul that hits a GGUF weight is dispatched to custom Metal kernels in this repo, which decode the blocks on the fly and do the math right there: single-token decode, prompt prefill and mixture-of-experts dispatch each have their own kernel.
+- 20 block formats: IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, Q2_K to Q6_K, Q8_0, Q4_0/Q4_1/Q5_0/Q5_1, MXFP4. Every decoder is checked bit for bit against ggml's own dequant.
+- Same answers as llama.cpp (greedy output checked file by file, see `scripts/parity.py`), faster on the decode and prefill numbers below.
+
+What mlx-serve keeps doing: the transformer itself (attention, norms, routing, KV cache, sampling, speculative decoding), it only needs a thin bridge to this repo.
+
+It's a separate repo on purpose, it will grow as models get added, and I want to encourage the community to open many PR's here.
 
 So we can add support for *MODERN* models, please dont add support for llama 1,2,etc.. nobody uses that anymore. If a model does not support tool calling, we do not add support for it here.
 
