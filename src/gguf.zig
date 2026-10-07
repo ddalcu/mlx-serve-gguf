@@ -4,6 +4,13 @@ const std = @import("std");
 const quants = @import("quants.zig");
 const GgmlType = quants.GgmlType;
 
+// zig 0.17 portability. On Linux std.c.fstat is void and std.posix exports
+// no Stat either (std dropped the Linux stat wrappers because per-arch
+// struct stat layouts vary, and points Linux code at statx). The file size
+// here comes from the statx syscall (std.os.linux.statx), whose Statx is
+// one arch-independent layout for every Linux target; other OSes keep
+// std.c.fstat, which is real there.
+
 pub const Error = error{
     BadMagic,
     UnsupportedVersion,
@@ -174,9 +181,17 @@ pub const File = struct {
         const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;
         defer _ = std.c.close(fd); // the mapping outlives the fd
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
-        const map = try std.posix.mmap(null, @intCast(st.size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+        const size: u64 = if (@import("builtin").os.tag == .linux) blk: {
+            var stx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
+            const rc = std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true, .SIZE = true }, &stx);
+            if (std.os.linux.errno(rc) != .SUCCESS or !stx.mask.SIZE) return error.StatFailed;
+            break :blk stx.size;
+        } else blk: {
+            var st: std.c.Stat = undefined;
+            if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
+            break :blk @intCast(st.size);
+        };
+        const map = try std.posix.mmap(null, @intCast(size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
         errdefer std.posix.munmap(map);
         var f = try parse(allocator, map);
         f.map = map;
