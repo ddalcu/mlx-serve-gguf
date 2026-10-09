@@ -174,9 +174,10 @@ pub const File = struct {
         const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;
         defer _ = std.c.close(fd); // the mapping outlives the fd
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
-        const map = try std.posix.mmap(null, @intCast(st.size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+        // lseek, not fstat: std.c.fstat is void on Linux in Zig 0.17.
+        const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+        if (size < 0) return error.StatFailed;
+        const map = try std.posix.mmap(null, @intCast(size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
         errdefer std.posix.munmap(map);
         var f = try parse(allocator, map);
         f.map = map;
